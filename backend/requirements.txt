@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+rdflib
+anthropic
+python-dotenv
+pydantic
