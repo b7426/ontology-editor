@@ -5,10 +5,12 @@ set -e
 PROJECT_ID="${GCP_PROJECT_ID:-your-project-id}"
 REGION="${GCP_REGION:-us-central1}"
 SERVICE_NAME="ontology-editor-api"
+API_KEY="${API_KEY:-}"
 
 echo "=== Ontology Editor Deployment ==="
 echo "Project: $PROJECT_ID"
 echo "Region: $REGION"
+echo "API Key: ${API_KEY:+configured}"
 echo ""
 
 # Check if gcloud is installed
@@ -36,16 +38,24 @@ deploy_backend() {
         --tag gcr.io/$PROJECT_ID/$SERVICE_NAME
 
     # Deploy to Cloud Run
-    gcloud run deploy $SERVICE_NAME \
-        --project=$PROJECT_ID \
-        --image gcr.io/$PROJECT_ID/$SERVICE_NAME \
-        --region $REGION \
-        --platform managed \
-        --allow-unauthenticated \
-        --memory 256Mi \
-        --cpu 1 \
-        --min-instances 0 \
-        --max-instances 1
+    DEPLOY_ARGS=(
+        "--project=$PROJECT_ID"
+        "--image" "gcr.io/$PROJECT_ID/$SERVICE_NAME"
+        "--region" "$REGION"
+        "--platform" "managed"
+        "--allow-unauthenticated"
+        "--memory" "256Mi"
+        "--cpu" "1"
+        "--min-instances" "0"
+        "--max-instances" "1"
+    )
+
+    # Add API_KEY if set
+    if [ -n "$API_KEY" ]; then
+        DEPLOY_ARGS+=("--set-env-vars" "API_KEY=$API_KEY")
+    fi
+
+    gcloud run deploy $SERVICE_NAME "${DEPLOY_ARGS[@]}"
 
     # Get the service URL
     BACKEND_URL=$(gcloud run services describe $SERVICE_NAME \
@@ -67,8 +77,8 @@ deploy_frontend() {
 
     cd frontend
 
-    # Build with the backend URL
-    VITE_API_URL=$BACKEND_URL npm run build
+    # Build with the backend URL and API key
+    VITE_API_URL=$BACKEND_URL VITE_API_KEY=$API_KEY npm run build
 
     # Deploy to Firebase
     firebase deploy --only hosting --project=$PROJECT_ID
@@ -106,6 +116,7 @@ case "${1:-all}" in
         echo "Environment variables:"
         echo "  GCP_PROJECT_ID - Your GCP project ID"
         echo "  GCP_REGION     - GCP region (default: us-central1)"
+        echo "  API_KEY        - API key for authentication (optional)"
         exit 1
         ;;
 esac

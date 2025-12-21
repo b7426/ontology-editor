@@ -5,17 +5,26 @@ import { downloadTurtle } from './utils/exportRdf'
 import type { Node, Edge } from 'reactflow'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+const API_KEY = import.meta.env.VITE_API_KEY || ''
+
+const apiHeaders = (): HeadersInit => {
+  const headers: HeadersInit = {}
+  if (API_KEY) {
+    headers['X-API-Key'] = API_KEY
+  }
+  return headers
+}
 
 type TabType = 'graph' | 'triples'
 
 function App() {
   const [backendStatus, setBackendStatus] = useState<'loading' | 'ok' | 'error'>('loading')
-  const [activeTab, setActiveTab] = useState<TabType>('graph')
+  const [activeTab, setActiveTab] = useState<TabType>('triples')
   const [nodes, setNodes] = useState<Node[]>([])
   const [edges, setEdges] = useState<Edge[]>([])
 
   useEffect(() => {
-    fetch(`${API_URL}/health`)
+    fetch(`${API_URL}/health`, { headers: apiHeaders() })
       .then((res) => res.json())
       .then((data) => {
         if (data.status === 'ok') {

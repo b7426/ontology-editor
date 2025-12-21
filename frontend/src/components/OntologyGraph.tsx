@@ -16,6 +16,15 @@ import type { Connection, Node, Edge } from 'reactflow';
 import 'reactflow/dist/style.css';
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const API_KEY = import.meta.env.VITE_API_KEY || '';
+
+const apiHeaders = (): HeadersInit => {
+  const headers: HeadersInit = {};
+  if (API_KEY) {
+    headers['X-API-Key'] = API_KEY;
+  }
+  return headers;
+};
 
 const defaultNodes: Node[] = [
   {
@@ -75,7 +84,7 @@ function OntologyGraphInner({ onGraphChange }: OntologyGraphProps) {
   const { screenToFlowPosition } = useReactFlow();
 
   useEffect(() => {
-    fetch(`${API_URL}/graph`)
+    fetch(`${API_URL}/graph`, { headers: apiHeaders() })
       .then((res) => res.json())
       .then((data) => {
         if (data.nodes && data.nodes.length > 0) {
@@ -112,7 +121,7 @@ function OntologyGraphInner({ onGraphChange }: OntologyGraphProps) {
     try {
       const response = await fetch(`${API_URL}/graph`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...apiHeaders() },
         body: JSON.stringify({ nodes, edges }),
       });
       if (response.ok) {
