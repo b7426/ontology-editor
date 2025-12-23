@@ -14,67 +14,22 @@ import {
 } from 'reactflow';
 import type { Connection, Node, Edge } from 'reactflow';
 import 'reactflow/dist/style.css';
-
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
-const API_KEY = import.meta.env.VITE_API_KEY || '';
-
-const apiHeaders = (): HeadersInit => {
-  const headers: HeadersInit = {};
-  if (API_KEY) {
-    headers['X-API-Key'] = API_KEY;
-  }
-  return headers;
-};
-
-const defaultNodes: Node[] = [
-  {
-    id: '1',
-    type: 'default',
-    data: { label: 'Thing' },
-    position: { x: 250, y: 0 },
-    style: { background: '#6366f1', color: 'white', border: 'none' },
-  },
-  {
-    id: '2',
-    type: 'default',
-    data: { label: 'Person' },
-    position: { x: 100, y: 100 },
-    style: { background: '#8b5cf6', color: 'white', border: 'none' },
-  },
-  {
-    id: '3',
-    type: 'default',
-    data: { label: 'Organization' },
-    position: { x: 400, y: 100 },
-    style: { background: '#8b5cf6', color: 'white', border: 'none' },
-  },
-  {
-    id: '4',
-    type: 'default',
-    data: { label: 'Employee' },
-    position: { x: 100, y: 200 },
-    style: { background: '#a78bfa', color: 'white', border: 'none' },
-  },
-];
-
-const defaultEdges: Edge[] = [
-  { id: 'e1-2', source: '1', target: '2', label: 'subClassOf', animated: true },
-  { id: 'e1-3', source: '1', target: '3', label: 'subClassOf', animated: true },
-  { id: 'e2-4', source: '2', target: '4', label: 'subClassOf', animated: true },
-  { id: 'e4-3', source: '4', target: '3', label: 'worksFor', style: { stroke: '#f59e0b' } },
-];
+import { API_URL, apiHeaders } from '../utils/api';
+import type { OntologyMeta } from '../types';
 
 let nodeId = 100;
 
 interface OntologyGraphProps {
   onGraphChange?: (nodes: Node[], edges: Edge[]) => void;
+  currentOntology?: OntologyMeta | null;
+  username?: string | null;
 }
 
-function OntologyGraphInner({ onGraphChange }: OntologyGraphProps) {
+function OntologyGraphInner({ onGraphChange, currentOntology, username }: OntologyGraphProps) {
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [newNodeLabel, setNewNodeLabel] = useState('');
   const [showNodeInput, setShowNodeInput] = useState(false);
   const [inputPosition, setInputPosition] = useState({ x: 0, y: 0 });
@@ -83,26 +38,35 @@ function OntologyGraphInner({ onGraphChange }: OntologyGraphProps) {
   const reactFlowWrapper = useRef<HTMLDivElement>(null);
   const { screenToFlowPosition } = useReactFlow();
 
+  // Load ontology when it changes
   useEffect(() => {
-    fetch(`${API_URL}/graph`, { headers: apiHeaders() })
+    if (!currentOntology || !username) {
+      setNodes([]);
+      setEdges([]);
+      return;
+    }
+
+    setLoading(true);
+    fetch(`${API_URL}/ontologies/${username}/${currentOntology.id}`, { headers: apiHeaders() })
       .then((res) => res.json())
       .then((data) => {
-        if (data.nodes && data.nodes.length > 0) {
-          setNodes(data.nodes);
-          setEdges(data.edges);
-          const maxId = Math.max(...data.nodes.map((n: Node) => parseInt(n.id) || 0));
+        const graphNodes = data.graph?.nodes || [];
+        const graphEdges = data.graph?.edges || [];
+        setNodes(graphNodes);
+        setEdges(graphEdges);
+        if (graphNodes.length > 0) {
+          const maxId = Math.max(...graphNodes.map((n: Node) => parseInt(n.id) || 0));
           nodeId = maxId + 1;
         } else {
-          setNodes(defaultNodes);
-          setEdges(defaultEdges);
+          nodeId = 1;
         }
       })
       .catch(() => {
-        setNodes(defaultNodes);
-        setEdges(defaultEdges);
+        setNodes([]);
+        setEdges([]);
       })
       .finally(() => setLoading(false));
-  }, [setNodes, setEdges]);
+  }, [currentOntology?.id, username, setNodes, setEdges]);
 
   // Notify parent of graph changes
   useEffect(() => {
@@ -117,12 +81,21 @@ function OntologyGraphInner({ onGraphChange }: OntologyGraphProps) {
   );
 
   const handleSave = async () => {
+    if (!currentOntology || !username) {
+      setSaveStatus('error');
+      return;
+    }
+
     setSaveStatus('saving');
     try {
-      const response = await fetch(`${API_URL}/graph`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...apiHeaders() },
-        body: JSON.stringify({ nodes, edges }),
+      const response = await fetch(`${API_URL}/ontologies/${username}/${currentOntology.id}`, {
+        method: 'PUT',
+        headers: apiHeaders(),
+        body: JSON.stringify({
+          id: currentOntology.id,
+          name: currentOntology.name,
+          graph: { nodes, edges }
+        }),
       });
       if (response.ok) {
         setSaveStatus('saved');
@@ -229,6 +202,17 @@ function OntologyGraphInner({ onGraphChange }: OntologyGraphProps) {
     }
   };
 
+  if (!currentOntology) {
+    return (
+      <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', backgroundColor: '#f8fafc' }}>
+        <div style={{ textAlign: 'center', color: '#64748b' }}>
+          <p style={{ fontSize: '18px', marginBottom: '8px' }}>No ontology selected</p>
+          <p style={{ fontSize: '14px' }}>Select or create an ontology from the File tab</p>
+        </div>
+      </div>
+    );
+  }
+
   if (loading) {
     return (
       <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -328,10 +312,10 @@ function OntologyGraphInner({ onGraphChange }: OntologyGraphProps) {
   );
 }
 
-export default function OntologyGraph({ onGraphChange }: OntologyGraphProps) {
+export default function OntologyGraph({ onGraphChange, currentOntology, username }: OntologyGraphProps) {
   return (
     <ReactFlowProvider>
-      <OntologyGraphInner onGraphChange={onGraphChange} />
+      <OntologyGraphInner onGraphChange={onGraphChange} currentOntology={currentOntology} username={username} />
     </ReactFlowProvider>
   );
 }

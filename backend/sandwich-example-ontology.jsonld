@@ -1,0 +1,173 @@
+{
+  "@context": {
+    "@vocab": "https://schema.org/",
+    "aiia": "https://aiia.example/ontology#",
+    "identifier": "@id",
+    "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+    "owl": "http://www.w3.org/2002/07/owl#",
+    "xsd": "http://www.w3.org/2001/XMLSchema#"
+  },
+  "@id": "aiia:SandwichOntology",
+  "@type": "owl:Ontology",
+  "name": "Sandwich Ontology",
+  "description": "An ontology describing sandwiches, their components, and preparation processes.",
+  "creator": {
+    "@type": "Person",
+    "name": "AIIA Example Library"
+  },
+  "inLanguage": "en",
+  "version": "0.1.0",
+  "license": "https://creativecommons.org/licenses/by/4.0/",
+  "aiia:entities": [
+    {
+      "@id": "aiia:Sandwich",
+      "@type": "owl:Class",
+      "rdfs:label": "Sandwich",
+      "description": "A food item consisting of fillings between slices of bread or similar carriers.",
+      "rdfs:subClassOf": {
+        "@id": "MenuItem"
+      }
+    },
+    {
+      "@id": "aiia:Bread",
+      "@type": "owl:Class",
+      "rdfs:label": "Bread",
+      "description": "A baked food product used as the structural base of a sandwich.",
+      "rdfs:subClassOf": {
+        "@id": "Food"
+      }
+    },
+    {
+      "@id": "aiia:Filling",
+      "@type": "owl:Class",
+      "rdfs:label": "Filling",
+      "description": "A food component placed between layers of bread in a sandwich.",
+      "rdfs:subClassOf": {
+        "@id": "Food"
+      }
+    },
+    {
+      "@id": "aiia:Condiment",
+      "@type": "owl:Class",
+      "rdfs:label": "Condiment",
+      "description": "A sauce or spread applied to a sandwich to enhance flavor.",
+      "rdfs:subClassOf": {
+        "@id": "Seasoning"
+      }
+    },
+    {
+      "@id": "aiia:PreparationStep",
+      "@type": "owl:Class",
+      "rdfs:label": "Preparation Step",
+      "description": "An ordered action for assembling or preparing a sandwich.",
+      "rdfs:subClassOf": {
+        "@id": "HowToStep"
+      }
+    }
+  ],
+  "aiia:datatypes": [
+    {
+      "@id": "aiia:hasServingTemperature",
+      "@type": "owl:DatatypeProperty",
+      "rdfs:label": "has serving temperature",
+      "description": "Indicates the preferred serving temperature for the sandwich.",
+      "domain": "aiia:Sandwich",
+      "range": "xsd:string"
+    },
+    {
+      "@id": "aiia:hasCalorieCount",
+      "@type": "owl:DatatypeProperty",
+      "rdfs:label": "has calorie count",
+      "description": "Specifies the caloric value per serving.",
+      "domain": "aiia:Sandwich",
+      "range": "NutritionInformation"
+    },
+    {
+      "@id": "aiia:popularSoupPairing",
+      "@type": "owl:DatatypeProperty",
+      "rdfs:label": "popular soup pairing",
+      "description": "Indicates a soup that is commonly paired with the sandwich.",
+      "domain": "aiia:Sandwich",
+      "range": "xsd:string"
+    }
+  ],
+  "aiia:relationships": [
+    {
+      "@id": "aiia:usesBread",
+      "@type": "owl:ObjectProperty",
+      "rdfs:label": "uses bread",
+      "description": "Relates a sandwich to the bread type used.",
+      "domain": "aiia:Sandwich",
+      "range": "aiia:Bread",
+      "rdfs:subPropertyOf": {
+        "@id": "recipeIngredient"
+      }
+    },
+    {
+      "@id": "aiia:hasFilling",
+      "@type": "owl:ObjectProperty",
+      "rdfs:label": "has filling",
+      "description": "Relates a sandwich to its fillings.",
+      "domain": "aiia:Sandwich",
+      "range": "aiia:Filling",
+      "rdfs:subPropertyOf": {
+        "@id": "recipeIngredient"
+      },
+      "owl:minCardinality": 0
+    },
+    {
+      "@id": "aiia:includesCondiment",
+      "@type": "owl:ObjectProperty",
+      "rdfs:label": "includes condiment",
+      "description": "Relates a sandwich to condiments used.",
+      "domain": "aiia:Sandwich",
+      "range": "aiia:Condiment",
+      "rdfs:subPropertyOf": {
+        "@id": "recipeIngredient"
+      },
+      "owl:minCardinality": 0
+    },
+    {
+      "@id": "aiia:hasPreparationStep",
+      "@type": "owl:ObjectProperty",
+      "rdfs:label": "has preparation step",
+      "description": "Associates a sandwich with ordered preparation steps.",
+      "domain": "aiia:Sandwich",
+      "range": "aiia:PreparationStep",
+      "rdfs:subPropertyOf": {
+        "@id": "recipeInstructions"
+      }
+    },
+    {
+      "@id": "aiia:pairedWith",
+      "@type": "owl:ObjectProperty",
+      "rdfs:label": "paired with",
+      "description": "Suggests complementary beverages or sides.",
+      "domain": "aiia:Sandwich",
+      "range": "MenuItem"
+    }
+  ],
+  "aiia:constraints": [
+    {
+      "@id": "aiia:ClassicSandwichShape",
+      "@type": "owl:Class",
+      "rdfs:label": "Classic Sandwich Shape Constraint",
+      "description": "Defines a standard sandwich as having exactly two bread components.",
+      "owl:equivalentClass": {
+        "@type": "owl:Class",
+        "owl:intersectionOf": [
+          {
+            "@id": "aiia:Sandwich"
+          },
+          {
+            "@type": "owl:Restriction",
+            "owl:onProperty": {
+              "@id": "aiia:usesBread"
+            },
+            "owl:cardinality": 2
+          }
+        ]
+      }
+    }
+  ]
+}
