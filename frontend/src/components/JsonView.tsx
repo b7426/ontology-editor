@@ -11,18 +11,35 @@ interface JsonViewProps {
 export default function JsonView({ nodes, edges, ontologyName }: JsonViewProps) {
   const [copied, setCopied] = useState(false);
 
+  // Create a map from internal IDs to human-readable labels
+  const idToLabel = new Map<string, string>();
+  nodes.forEach((n) => {
+    idToLabel.set(n.id, n.data.label || n.id);
+  });
+
+  // Helper to create a readable ID from a label
+  const toReadableId = (label: string) => label.replace(/\s+/g, '_');
+
   const jsonData = {
-    nodes: nodes.map((n) => ({
-      id: n.id,
-      label: n.data.label,
-      position: n.position,
-    })),
-    edges: edges.map((e) => ({
-      id: e.id,
-      source: e.source,
-      target: e.target,
-      label: e.label,
-    })),
+    nodes: nodes.map((n) => {
+      const label = n.data.label || n.id;
+      return {
+        id: toReadableId(label),
+        label: label,
+        position: n.position,
+      };
+    }),
+    edges: edges.map((e) => {
+      const sourceLabel = idToLabel.get(e.source) || e.source;
+      const targetLabel = idToLabel.get(e.target) || e.target;
+      const predicate = typeof e.label === 'string' ? e.label : 'relatedTo';
+      return {
+        id: `${toReadableId(sourceLabel)}_${predicate}_${toReadableId(targetLabel)}`,
+        source: toReadableId(sourceLabel),
+        target: toReadableId(targetLabel),
+        predicate: predicate,
+      };
+    }),
   };
 
   const jsonString = JSON.stringify(jsonData, null, 2);

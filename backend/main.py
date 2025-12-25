@@ -379,12 +379,27 @@ class UserInfo(BaseModel):
 
 
 def delete_user_ontologies(username: str) -> int:
-    """Delete all ontologies for a user. Returns count of deleted ontologies."""
+    """Delete all ontologies and their knowledge graphs for a user. Returns count of deleted ontologies."""
     ontologies = load_user_ontologies(username)
     count = 0
 
     for ontology in ontologies:
-        ontology_file = get_ontology_file(ontology["id"])
+        ontology_id = ontology["id"]
+        
+        # Delete all knowledge graphs for this ontology
+        kgs = load_knowledge_graphs(username, ontology_id)
+        for kg in kgs:
+            kg_file = get_kg_file(kg["id"])
+            if validate_file_path(kg_file) and kg_file.exists():
+                kg_file.unlink()
+        
+        # Delete the knowledge graphs index file
+        kg_index_file = get_kg_index_file(username, ontology_id)
+        if kg_index_file.exists():
+            kg_index_file.unlink()
+        
+        # Delete the ontology file
+        ontology_file = get_ontology_file(ontology_id)
         if validate_file_path(ontology_file) and ontology_file.exists():
             ontology_file.unlink()
             count += 1
@@ -517,6 +532,25 @@ class OntologySave(BaseModel):
     graph: Graph
 
 
+class KnowledgeGraphCreate(BaseModel):
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        if len(v) > 100:
+            raise ValueError("Name too long")
+        if len(v) < 1:
+            raise ValueError("Name required")
+        return v
+
+
+class KnowledgeGraphSave(BaseModel):
+    id: str
+    name: str
+    data: dict
+
+
 def get_user_ontologies_file(username: str) -> Path:
     """Get the path to a user's ontologies index file."""
     return ONTOLOGIES_DIR / f"{username}_index.json"
@@ -527,6 +561,40 @@ def get_ontology_file(ontology_id: str) -> Path:
     # Sanitize ontology_id to prevent path traversal
     safe_id = "".join(c for c in ontology_id if c.isalnum() or c in "-_")
     return ONTOLOGIES_DIR / f"{safe_id}.json"
+
+
+# Knowledge Graph storage
+KNOWLEDGE_GRAPHS_DIR = DATA_DIR / "knowledge_graphs"
+KNOWLEDGE_GRAPHS_DIR.mkdir(exist_ok=True)
+
+
+def get_kg_index_file(username: str, ontology_id: str) -> Path:
+    """Get the path to a knowledge graphs index file for a user's ontology."""
+    safe_username = "".join(c for c in username if c.isalnum() or c in "-_")
+    safe_ontology_id = "".join(c for c in ontology_id if c.isalnum() or c in "-_")
+    return KNOWLEDGE_GRAPHS_DIR / f"{safe_username}_{safe_ontology_id}_kg_index.json"
+
+
+def get_kg_file(kg_id: str) -> Path:
+    """Get the path to a knowledge graph data file."""
+    safe_id = "".join(c for c in kg_id if c.isalnum() or c in "-_")
+    return KNOWLEDGE_GRAPHS_DIR / f"{safe_id}.json"
+
+
+def load_knowledge_graphs(username: str, ontology_id: str) -> list[dict]:
+    """Load list of knowledge graphs for a user's ontology."""
+    index_file = get_kg_index_file(username, ontology_id)
+    if not index_file.exists():
+        return []
+    with open(index_file) as f:
+        return json.load(f)
+
+
+def save_knowledge_graphs_index(username: str, ontology_id: str, kgs: list[dict]) -> None:
+    """Save list of knowledge graphs for a user's ontology."""
+    index_file = get_kg_index_file(username, ontology_id)
+    with open(index_file, "w") as f:
+        json.dump(kgs, f, indent=2)
 
 
 def load_user_ontologies(username: str) -> list[dict]:
@@ -618,6 +686,13 @@ def create_default_ontology_for_user(username: str) -> dict:
 async def list_ontologies(username: str, _: Annotated[bool, Depends(verify_api_key)]):
     """List all ontologies for a user."""
     ontologies = load_user_ontologies(username)
+
+    # Create default example ontology if user doesn't have it yet
+    has_example = any("(Example)" in o.get("name", "") for o in ontologies)
+    if not has_example:
+        create_default_ontology_for_user(username)
+        ontologies = load_user_ontologies(username)
+
     return {"ontologies": ontologies}
 
 
@@ -873,12 +948,24 @@ async def save_ontology(username: str, ontology_id: str, data: OntologySave, _: 
 
 @app.delete("/ontologies/{username}/{ontology_id}")
 async def delete_ontology(username: str, ontology_id: str, _: Annotated[bool, Depends(verify_api_key)]):
-    """Delete an ontology."""
+    """Delete an ontology and all its knowledge graphs."""
     # Verify ownership
     ontologies = load_user_ontologies(username)
     meta_idx = next((i for i, o in enumerate(ontologies) if o["id"] == ontology_id), None)
     if meta_idx is None:
         raise HTTPException(status_code=404, detail="Ontology not found")
+
+    # Delete all knowledge graphs for this ontology
+    kgs = load_knowledge_graphs(username, ontology_id)
+    for kg in kgs:
+        kg_file = get_kg_file(kg["id"])
+        if validate_file_path(kg_file) and kg_file.exists():
+            kg_file.unlink()
+    
+    # Delete the knowledge graphs index file
+    kg_index_file = get_kg_index_file(username, ontology_id)
+    if kg_index_file.exists():
+        kg_index_file.unlink()
 
     ontology_file = get_ontology_file(ontology_id)
     if validate_file_path(ontology_file) and ontology_file.exists():
@@ -888,6 +975,154 @@ async def delete_ontology(username: str, ontology_id: str, _: Annotated[bool, De
     ontologies.pop(meta_idx)
     save_user_ontologies(username, ontologies)
 
+    return {"status": "deleted", "knowledge_graphs_deleted": len(kgs)}
+
+
+def verify_ontology_ownership(username: str, ontology_id: str) -> bool:
+    """Verify that a user owns an ontology. Returns True if owned."""
+    ontologies = load_user_ontologies(username)
+    return any(o["id"] == ontology_id for o in ontologies)
+
+
+# Knowledge Graph API models
+class KnowledgeGraphMeta(BaseModel):
+    id: str
+    name: str
+    owner: str
+    ontology_id: str
+    created_at: str
+    updated_at: str
+
+
+@app.get("/knowledge-graphs/{username}/{ontology_id}")
+async def list_knowledge_graphs(username: str, ontology_id: str, _: Annotated[bool, Depends(verify_api_key)]):
+    """List all knowledge graphs for a user's ontology."""
+    # Verify ownership
+    if not verify_ontology_ownership(username, ontology_id):
+        raise HTTPException(status_code=404, detail="Ontology not found")
+    
+    kgs = load_knowledge_graphs(username, ontology_id)
+    return {"knowledge_graphs": kgs}
+
+
+@app.post("/knowledge-graphs/{username}/{ontology_id}")
+async def create_knowledge_graph(username: str, ontology_id: str, data: KnowledgeGraphCreate, _: Annotated[bool, Depends(verify_api_key)]):
+    """Create a new knowledge graph for a user's ontology."""
+    # Verify ownership
+    if not verify_ontology_ownership(username, ontology_id):
+        raise HTTPException(status_code=404, detail="Ontology not found")
+    
+    kg_id = secrets.token_hex(8)
+    now = datetime.utcnow().isoformat()
+    
+    # Create knowledge graph metadata
+    meta = {
+        "id": kg_id,
+        "name": data.name,
+        "owner": username,
+        "ontology_id": ontology_id,
+        "created_at": now,
+        "updated_at": now,
+    }
+    
+    # Save empty data
+    kg_file = get_kg_file(kg_id)
+    if not validate_file_path(kg_file):
+        raise HTTPException(status_code=500, detail="Invalid file path")
+    
+    with open(kg_file, "w") as f:
+        json.dump({}, f, indent=2)
+    
+    # Add to index
+    kgs = load_knowledge_graphs(username, ontology_id)
+    kgs.append(meta)
+    save_knowledge_graphs_index(username, ontology_id, kgs)
+    
+    return {"status": "created", "knowledge_graph": meta}
+
+
+@app.get("/knowledge-graphs/{username}/{ontology_id}/{kg_id}")
+async def get_knowledge_graph(username: str, ontology_id: str, kg_id: str, _: Annotated[bool, Depends(verify_api_key)]):
+    """Get a specific knowledge graph."""
+    # Verify ownership
+    if not verify_ontology_ownership(username, ontology_id):
+        raise HTTPException(status_code=404, detail="Ontology not found")
+    
+    # Verify knowledge graph exists and belongs to this ontology
+    kgs = load_knowledge_graphs(username, ontology_id)
+    meta = next((kg for kg in kgs if kg["id"] == kg_id), None)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Knowledge graph not found")
+    
+    # Load the knowledge graph data
+    kg_file = get_kg_file(kg_id)
+    if not validate_file_path(kg_file):
+        raise HTTPException(status_code=500, detail="Invalid file path")
+    
+    if not kg_file.exists():
+        return {"meta": meta, "data": {}}
+    
+    with open(kg_file) as f:
+        kg_data = json.load(f)
+    
+    return {"meta": meta, "data": kg_data}
+
+
+@app.put("/knowledge-graphs/{username}/{ontology_id}/{kg_id}")
+async def update_knowledge_graph(username: str, ontology_id: str, kg_id: str, data: KnowledgeGraphSave, _: Annotated[bool, Depends(verify_api_key)]):
+    """Update a knowledge graph."""
+    # Verify ownership
+    if not verify_ontology_ownership(username, ontology_id):
+        raise HTTPException(status_code=404, detail="Ontology not found")
+    
+    # Verify knowledge graph exists and belongs to this ontology
+    kgs = load_knowledge_graphs(username, ontology_id)
+    meta_idx = next((i for i, kg in enumerate(kgs) if kg["id"] == kg_id), None)
+    if meta_idx is None:
+        raise HTTPException(status_code=404, detail="Knowledge graph not found")
+    
+    # Verify the IDs match
+    if data.id != kg_id:
+        raise HTTPException(status_code=400, detail="Knowledge graph ID mismatch")
+    
+    # Save knowledge graph data
+    kg_file = get_kg_file(kg_id)
+    if not validate_file_path(kg_file):
+        raise HTTPException(status_code=500, detail="Invalid file path")
+    
+    with open(kg_file, "w") as f:
+        json.dump(data.data, f, indent=2)
+    
+    # Update metadata
+    kgs[meta_idx]["name"] = data.name
+    kgs[meta_idx]["updated_at"] = datetime.utcnow().isoformat()
+    save_knowledge_graphs_index(username, ontology_id, kgs)
+    
+    return {"status": "updated", "knowledge_graph": kgs[meta_idx]}
+
+
+@app.delete("/knowledge-graphs/{username}/{ontology_id}/{kg_id}")
+async def delete_knowledge_graph(username: str, ontology_id: str, kg_id: str, _: Annotated[bool, Depends(verify_api_key)]):
+    """Delete a knowledge graph."""
+    # Verify ownership
+    if not verify_ontology_ownership(username, ontology_id):
+        raise HTTPException(status_code=404, detail="Ontology not found")
+    
+    # Verify knowledge graph exists and belongs to this ontology
+    kgs = load_knowledge_graphs(username, ontology_id)
+    meta_idx = next((i for i, kg in enumerate(kgs) if kg["id"] == kg_id), None)
+    if meta_idx is None:
+        raise HTTPException(status_code=404, detail="Knowledge graph not found")
+    
+    # Delete the data file
+    kg_file = get_kg_file(kg_id)
+    if validate_file_path(kg_file) and kg_file.exists():
+        kg_file.unlink()
+    
+    # Remove from index
+    kgs.pop(meta_idx)
+    save_knowledge_graphs_index(username, ontology_id, kgs)
+    
     return {"status": "deleted"}
 
 

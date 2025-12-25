@@ -131,10 +131,10 @@ export function resetChatPrompt(): void {
 export function getChatPanelWidth(): number {
   try {
     const stored = localStorage.getItem(STORAGE_KEYS.CHAT_PANEL_WIDTH);
-    const width = stored ? parseFloat(stored) : 35;
+    const width = stored ? parseFloat(stored) : 30;
     return Math.min(50, Math.max(20, width));
   } catch {
-    return 35;
+    return 30;
   }
 }
 

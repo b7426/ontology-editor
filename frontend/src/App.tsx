@@ -6,11 +6,12 @@ import Admin from './components/Admin'
 import Settings from './components/Settings'
 import Landing from './components/Landing'
 import LoginModal from './components/LoginModal'
+import KGNameModal from './components/KGNameModal'
 import FileManager from './components/FileManager'
 import JsonView from './components/JsonView'
 import { API_URL, apiHeaders } from './utils/api'
 import type { Node, Edge } from 'reactflow'
-import type { AuthState, OntologyMeta } from './types'
+import type { AuthState, OntologyMeta, KnowledgeGraphMeta, KnowledgeGraphsResponse } from './types'
 
 type TabType = 'file' | 'triples' | 'graph' | 'json' | 'admin' | 'settings'
 
@@ -42,6 +43,9 @@ function App() {
     }
     return null
   })
+  const [knowledgeGraphs, setKnowledgeGraphs] = useState<KnowledgeGraphMeta[]>([])
+  const [selectedKnowledgeGraph, setSelectedKnowledgeGraph] = useState<string | null>(null)
+  const [showKGNameModal, setShowKGNameModal] = useState(false)
 
   useEffect(() => {
     fetch(`${API_URL}/health`, { headers: apiHeaders() })
@@ -90,6 +94,27 @@ function App() {
         .catch((error) => {
           console.error('Failed to load ontology:', error)
         })
+    }
+  }, [auth.isLoggedIn, auth.username, currentOntology])
+
+  // Load knowledge graphs when ontology changes
+  useEffect(() => {
+    if (auth.isLoggedIn && auth.username && currentOntology) {
+      fetch(`${API_URL}/knowledge-graphs/${auth.username}/${currentOntology.id}`, {
+        headers: apiHeaders(),
+      })
+        .then((res) => res.json())
+        .then((data: KnowledgeGraphsResponse) => {
+          setKnowledgeGraphs(data.knowledge_graphs || [])
+          setSelectedKnowledgeGraph(null) // Reset selection when ontology changes
+        })
+        .catch((error) => {
+          console.error('Failed to load knowledge graphs:', error)
+          setKnowledgeGraphs([])
+        })
+    } else {
+      setKnowledgeGraphs([])
+      setSelectedKnowledgeGraph(null)
     }
   }, [auth.isLoggedIn, auth.username, currentOntology])
 
@@ -156,6 +181,58 @@ function App() {
     setActiveTab('graph')
   }
 
+  const handleCreateKnowledgeGraphClick = () => {
+    if (!currentOntology || !auth.username) {
+      alert('Please select an ontology first')
+      return
+    }
+    setShowKGNameModal(true)
+  }
+
+  const handleCreateKnowledgeGraph = async (name: string) => {
+    if (!currentOntology || !auth.username) {
+      console.error('Cannot create knowledge graph: missing ontology or username')
+      return
+    }
+
+    try {
+      console.log('Creating knowledge graph:', name)
+      const response = await fetch(`${API_URL}/knowledge-graphs/${auth.username}/${currentOntology.id}`, {
+        method: 'POST',
+        headers: apiHeaders(),
+        body: JSON.stringify({ name }),
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ detail: 'Failed to create knowledge graph' }))
+        console.error('Failed to create knowledge graph:', errorData)
+        alert(errorData.detail || 'Failed to create knowledge graph')
+        return
+      }
+
+      const result = await response.json()
+      console.log('Knowledge graph created:', result)
+
+      // Refresh knowledge graphs list
+      const kgResponse = await fetch(`${API_URL}/knowledge-graphs/${auth.username}/${currentOntology.id}`, {
+        headers: apiHeaders(),
+      })
+      if (kgResponse.ok) {
+        const kgData: KnowledgeGraphsResponse = await kgResponse.json()
+        setKnowledgeGraphs(kgData.knowledge_graphs || [])
+        // Select the newly created knowledge graph
+        if (result.knowledge_graph) {
+          setSelectedKnowledgeGraph(result.knowledge_graph.id)
+        }
+      }
+
+      setShowKGNameModal(false)
+    } catch (error) {
+      console.error('Failed to create knowledge graph:', error)
+      alert('Failed to create knowledge graph. Please check the console for details.')
+    }
+  }
+
   const tabStyle = (tab: TabType) => ({
     padding: '8px 16px',
     backgroundColor: activeTab === tab ? '#6366f1' : 'transparent',
@@ -182,8 +259,14 @@ function App() {
   }
 
   return (
-    <div style={{ width: '100vw', height: '100vh', display: 'flex', flexDirection: 'column' }}>
-      <header style={{
+    <>
+      <KGNameModal
+        isOpen={showKGNameModal}
+        onClose={() => setShowKGNameModal(false)}
+        onConfirm={handleCreateKnowledgeGraph}
+      />
+      <div style={{ width: '100vw', height: '100vh', display: 'flex', flexDirection: 'column' }}>
+        <header style={{
         backgroundColor: '#1e293b',
         color: 'white',
         padding: '16px',
@@ -199,45 +282,21 @@ function App() {
             </span>
           )}
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '16px', fontSize: '14px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <span>Backend:</span>
-            {backendStatus === 'loading' && (
-              <span style={{ color: '#facc15' }}>Connecting...</span>
-            )}
-            {backendStatus === 'ok' && (
-              <span style={{ color: '#4ade80', display: 'flex', alignItems: 'center', gap: '4px' }}>
-                <span style={{ width: '8px', height: '8px', backgroundColor: '#4ade80', borderRadius: '50%' }}></span>
-                Connected
-              </span>
-            )}
-            {backendStatus === 'error' && (
-              <span style={{ color: '#f87171', display: 'flex', alignItems: 'center', gap: '4px' }}>
-                <span style={{ width: '8px', height: '8px', backgroundColor: '#f87171', borderRadius: '50%' }}></span>
-                Disconnected
-              </span>
-            )}
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginLeft: '8px', paddingLeft: '16px', borderLeft: '1px solid #475569' }}>
-            <span style={{ color: '#94a3b8' }}>
-              {auth.username}
-              {auth.isAdmin && <span style={{ marginLeft: '6px', fontSize: '11px', backgroundColor: '#6366f1', padding: '2px 6px', borderRadius: '4px' }}>Admin</span>}
-            </span>
-            <button
-              onClick={handleLogout}
-              style={{
-                padding: '6px 12px',
-                backgroundColor: 'transparent',
-                color: '#94a3b8',
-                border: '1px solid #475569',
-                borderRadius: '4px',
-                cursor: 'pointer',
-                fontSize: '13px',
-              }}
-            >
-              Log Out
-            </button>
-          </div>
+        <div>
+          <button
+            onClick={handleLogout}
+            style={{
+              padding: '6px 12px',
+              backgroundColor: 'transparent',
+              color: '#94a3b8',
+              border: '1px solid #475569',
+              borderRadius: '4px',
+              cursor: 'pointer',
+              fontSize: '13px',
+            }}
+          >
+            Log Out
+          </button>
         </div>
       </header>
       <div style={{ backgroundColor: '#1e293b', paddingLeft: '16px', paddingRight: '16px', paddingBottom: '0', display: 'flex', justifyContent: 'space-between' }}>
@@ -277,8 +336,119 @@ function App() {
         )}
         {activeTab === 'triples' && (
           <>
-            <div style={{ flex: 1, overflow: 'hidden' }}>
-              <TriplesView nodes={nodes} edges={edges} />
+            <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+              {currentOntology && (
+                <div style={{ padding: '12px 20px', backgroundColor: '#ffffff', borderBottom: '1px solid #e2e8f0', display: 'flex', alignItems: 'center', gap: '12px', justifyContent: 'space-between' }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '14px', fontWeight: 500, color: '#1e293b' }}>
+                    <span>Knowledge Graph:</span>
+                    <select
+                      value={selectedKnowledgeGraph || ''}
+                      onChange={(e) => setSelectedKnowledgeGraph(e.target.value || null)}
+                      style={{
+                        padding: '6px 12px',
+                        border: '1px solid #cbd5e1',
+                        borderRadius: '6px',
+                        fontSize: '14px',
+                        backgroundColor: '#ffffff',
+                        color: '#1e293b',
+                        cursor: 'pointer',
+                        minWidth: '200px',
+                      }}
+                    >
+                      <option value="">None (use ontology graph)</option>
+                      {knowledgeGraphs.map((kg) => (
+                        <option key={kg.id} value={kg.id}>
+                          {kg.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <button
+                      onClick={handleCreateKnowledgeGraphClick}
+                      style={{
+                        padding: '6px 12px',
+                        backgroundColor: '#6366f1',
+                        color: 'white',
+                        border: 'none',
+                        borderRadius: '6px',
+                        fontSize: '14px',
+                        fontWeight: 500,
+                        cursor: 'pointer',
+                        transition: 'background-color 0.2s',
+                      }}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.style.backgroundColor = '#4f46e5'
+                      }}
+                      onMouseLeave={(e) => {
+                        e.currentTarget.style.backgroundColor = '#6366f1'
+                      }}
+                    >
+                      Add
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (selectedKnowledgeGraph && currentOntology && auth.username) {
+                          const saveFunction = (window as any).saveKnowledgeGraph;
+                          if (saveFunction && typeof saveFunction === 'function') {
+                            saveFunction();
+                          } else {
+                            alert('Save function not available. Please wait a moment and try again.');
+                          }
+                        } else {
+                          alert('Please select a knowledge graph to save');
+                        }
+                      }}
+                      disabled={!selectedKnowledgeGraph}
+                      style={{
+                        padding: '6px 12px',
+                        backgroundColor: selectedKnowledgeGraph ? '#22c55e' : '#94a3b8',
+                        color: 'white',
+                        border: 'none',
+                        borderRadius: '6px',
+                        fontSize: '14px',
+                        fontWeight: 500,
+                        cursor: selectedKnowledgeGraph ? 'pointer' : 'not-allowed',
+                        transition: 'background-color 0.2s',
+                      }}
+                      onMouseEnter={(e) => {
+                        if (selectedKnowledgeGraph) {
+                          e.currentTarget.style.backgroundColor = '#16a34a'
+                        }
+                      }}
+                      onMouseLeave={(e) => {
+                        if (selectedKnowledgeGraph) {
+                          e.currentTarget.style.backgroundColor = '#22c55e'
+                        }
+                      }}
+                    >
+                      Save
+                    </button>
+                  </div>
+                </div>
+              )}
+              <div style={{ flex: 1, overflow: 'hidden' }}>
+                <TriplesView
+                  nodes={nodes}
+                  edges={edges}
+                  selectedKnowledgeGraphId={selectedKnowledgeGraph}
+                  ontologyId={currentOntology?.id || null}
+                  username={auth.username}
+                  onKnowledgeGraphUpdate={() => {
+                    // Refresh knowledge graphs list if needed
+                    if (auth.username && currentOntology) {
+                      fetch(`${API_URL}/knowledge-graphs/${auth.username}/${currentOntology.id}`, {
+                        headers: apiHeaders(),
+                      })
+                        .then((res) => res.json())
+                        .then((data: KnowledgeGraphsResponse) => {
+                          setKnowledgeGraphs(data.knowledge_graphs || [])
+                        })
+                        .catch(console.error)
+                    }
+                  }}
+                />
+              </div>
             </div>
             <ChatPanel
               ontologyId={currentOntology?.id || null}
@@ -307,7 +477,43 @@ function App() {
         {activeTab === 'admin' && auth.isAdmin && auth.username && <Admin adminUser={auth.username} />}
         {activeTab === 'settings' && <Settings />}
       </main>
-    </div>
+      <footer style={{
+        backgroundColor: '#1e293b',
+        color: 'white',
+        padding: '12px 16px',
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        fontSize: '14px',
+        borderTop: '1px solid #334155'
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span>Backend:</span>
+          {backendStatus === 'loading' && (
+            <span style={{ color: '#facc15' }}>Connecting...</span>
+          )}
+          {backendStatus === 'ok' && (
+            <span style={{ color: '#4ade80', display: 'flex', alignItems: 'center', gap: '4px' }}>
+              <span style={{ width: '8px', height: '8px', backgroundColor: '#4ade80', borderRadius: '50%' }}></span>
+              Connected
+            </span>
+          )}
+          {backendStatus === 'error' && (
+            <span style={{ color: '#f87171', display: 'flex', alignItems: 'center', gap: '4px' }}>
+              <span style={{ width: '8px', height: '8px', backgroundColor: '#f87171', borderRadius: '50%' }}></span>
+              Disconnected
+            </span>
+          )}
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{ color: '#94a3b8' }}>
+            {auth.username}
+            {auth.isAdmin && <span style={{ marginLeft: '6px', fontSize: '11px', backgroundColor: '#6366f1', padding: '2px 6px', borderRadius: '4px' }}>Admin</span>}
+          </span>
+        </div>
+      </footer>
+      </div>
+    </>
   )
 }
 

@@ -86,3 +86,22 @@ export interface OntologyWithGraph {
   meta: OntologyMeta;
   graph: GraphData;
 }
+
+/**
+ * Knowledge Graph metadata
+ */
+export interface KnowledgeGraphMeta {
+  id: string;
+  name: string;
+  owner: string;
+  ontology_id: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * API response for knowledge graphs list
+ */
+export interface KnowledgeGraphsResponse {
+  knowledge_graphs: KnowledgeGraphMeta[];
+}

@@ -23,6 +23,11 @@ cleanup() {
 trap cleanup SIGINT SIGTERM
 
 case "${1:-all}" in
+    test)
+        echo "Running backend tests..."
+        cd backend
+        python -m pytest test_api.py -v
+        ;;
     backend)
         echo "Starting backend on http://localhost:8000"
         cd backend
@@ -58,9 +63,10 @@ case "${1:-all}" in
         wait
         ;;
     *)
-        echo "Usage: ./start.sh [backend|frontend|all]"
+        echo "Usage: ./start.sh [test|backend|frontend|all]"
         echo ""
         echo "Commands:"
+        echo "  test      - Run backend tests"
         echo "  backend   - Start only the backend API server"
         echo "  frontend  - Start only the frontend dev server"
         echo "  all       - Start both (default)"
