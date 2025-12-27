@@ -581,6 +581,274 @@ def get_kg_file(kg_id: str) -> Path:
     return KNOWLEDGE_GRAPHS_DIR / f"{safe_id}.json"
 
 
+# JSON-LD conversion functions
+def to_jsonld_ontology(internal_format: dict, ontology_name: str = "Ontology") -> dict:
+    """Convert internal ontology format (nodes/edges) to JSON-LD."""
+    nodes = internal_format.get("nodes", [])
+    edges = internal_format.get("edges", [])
+
+    # Build node ID to label mapping
+    id_to_label = {}
+    for node in nodes:
+        label = node.get("data", {}).get("label") or node.get("id")
+        id_to_label[node.get("id")] = label
+
+    # Helper to create safe URI
+    def to_uri(label: str) -> str:
+        return label.replace(" ", "_")
+
+    graph = []
+
+    # Add classes
+    for node in nodes:
+        label = node.get("data", {}).get("label") or node.get("id")
+        class_entry = {
+            "@id": to_uri(label),
+            "@type": "owl:Class",
+            "rdfs:label": label
+        }
+        # Store position as custom property for round-trip
+        if "position" in node:
+            class_entry["_position"] = node["position"]
+        if "id" in node:
+            class_entry["_nodeId"] = node["id"]
+        graph.append(class_entry)
+
+    # Add properties/relationships
+    for edge in edges:
+        source_label = id_to_label.get(edge.get("source"), edge.get("source"))
+        target_label = id_to_label.get(edge.get("target"), edge.get("target"))
+        predicate = edge.get("label", "relatedTo")
+
+        if predicate == "subClassOf":
+            # Add subClassOf to the class entry
+            for entry in graph:
+                if entry.get("@id") == to_uri(source_label):
+                    entry["rdfs:subClassOf"] = {"@id": to_uri(target_label)}
+                    break
+        else:
+            # Add as object property
+            prop_entry = {
+                "@id": to_uri(predicate),
+                "@type": "owl:ObjectProperty",
+                "rdfs:domain": {"@id": to_uri(source_label)},
+                "rdfs:range": {"@id": to_uri(target_label)},
+                "_edgeId": edge.get("id")
+            }
+            # Avoid duplicate properties
+            existing = next((e for e in graph if e.get("@id") == to_uri(predicate) and e.get("@type") == "owl:ObjectProperty"), None)
+            if not existing:
+                graph.append(prop_entry)
+
+    return {
+        "@context": {
+            "@vocab": "http://example.org/ontology#",
+            "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+            "owl": "http://www.w3.org/2002/07/owl#",
+            "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "@id": to_uri(ontology_name),
+        "@type": "owl:Ontology",
+        "rdfs:label": ontology_name,
+        "@graph": graph
+    }
+
+
+def from_jsonld_ontology(jsonld: dict) -> dict:
+    """Convert JSON-LD ontology back to internal format (nodes/edges)."""
+    graph = jsonld.get("@graph", [])
+
+    nodes = []
+    edges = []
+    node_id_counter = 1
+    edge_id_counter = 1
+
+    # Maps for reconstructing edges
+    uri_to_node_id = {}
+
+    # First pass: create nodes from classes
+    for entry in graph:
+        entry_type = entry.get("@type")
+        if entry_type == "owl:Class":
+            uri = entry.get("@id", "")
+            label = entry.get("rdfs:label", uri.replace("_", " "))
+
+            # Use stored node ID or generate new one
+            node_id = entry.get("_nodeId", str(node_id_counter))
+            if not entry.get("_nodeId"):
+                node_id_counter += 1
+
+            position = entry.get("_position", {"x": 100, "y": node_id_counter * 100})
+
+            nodes.append({
+                "id": node_id,
+                "type": "default",
+                "position": position,
+                "data": {"label": label}
+            })
+            uri_to_node_id[uri] = node_id
+
+            # Handle subClassOf
+            sub_class_of = entry.get("rdfs:subClassOf")
+            if sub_class_of:
+                target_uri = sub_class_of.get("@id") if isinstance(sub_class_of, dict) else sub_class_of
+                edges.append({
+                    "_source_uri": uri,
+                    "_target_uri": target_uri,
+                    "label": "subClassOf"
+                })
+
+    # Second pass: create edges from object properties
+    for entry in graph:
+        entry_type = entry.get("@type")
+        if entry_type == "owl:ObjectProperty":
+            predicate = entry.get("@id", "relatedTo").replace("_", " ")
+            domain = entry.get("rdfs:domain", {})
+            range_val = entry.get("rdfs:range", {})
+
+            source_uri = domain.get("@id") if isinstance(domain, dict) else domain
+            target_uri = range_val.get("@id") if isinstance(range_val, dict) else range_val
+
+            edge_id = entry.get("_edgeId", f"edge-{edge_id_counter}")
+            if not entry.get("_edgeId"):
+                edge_id_counter += 1
+
+            edges.append({
+                "_source_uri": source_uri,
+                "_target_uri": target_uri,
+                "label": predicate,
+                "id": edge_id
+            })
+
+    # Resolve edge URIs to node IDs
+    resolved_edges = []
+    for edge in edges:
+        source_uri = edge.get("_source_uri")
+        target_uri = edge.get("_target_uri")
+        source_id = uri_to_node_id.get(source_uri)
+        target_id = uri_to_node_id.get(target_uri)
+
+        if source_id and target_id:
+            resolved_edges.append({
+                "id": edge.get("id", f"edge-{len(resolved_edges) + 1}"),
+                "source": source_id,
+                "target": target_id,
+                "label": edge.get("label", "relatedTo")
+            })
+
+    return {"nodes": nodes, "edges": resolved_edges}
+
+
+def to_jsonld_kg(internal_format: dict, ontology_graph: dict = None) -> dict:
+    """Convert internal knowledge graph format to JSON-LD."""
+    instances = internal_format.get("instances", {})
+    relationships = internal_format.get("relationships", {})
+
+    def to_uri(label: str) -> str:
+        return label.replace(" ", "_")
+
+    graph = []
+
+    # Create instance entries
+    instance_uris = {}  # Maps class:instance to URI
+    for class_name, instance_list in instances.items():
+        for instance_name in instance_list:
+            uri = f"instance:{to_uri(instance_name)}"
+            instance_uris[f"{class_name}:{instance_name}"] = uri
+
+            entry = {
+                "@id": uri,
+                "@type": to_uri(class_name),
+                "rdfs:label": instance_name
+            }
+            graph.append(entry)
+
+    # Add relationships to instances
+    for rel_key, rel_values in relationships.items():
+        # Parse relationship key: "SourceClass:predicate:TargetClass"
+        parts = rel_key.split(":")
+        if len(parts) != 3:
+            continue
+        source_class, predicate, target_class = parts
+
+        # For each source instance, add the relationship
+        source_instances = instances.get(source_class, [])
+        for source_instance in source_instances:
+            source_uri = f"instance:{to_uri(source_instance)}"
+
+            # Find the graph entry for this source instance
+            for entry in graph:
+                if entry.get("@id") == source_uri:
+                    # Add the predicate with target instances
+                    targets = []
+                    for target_instance in rel_values:
+                        if target_instance in instances.get(target_class, []):
+                            targets.append({"@id": f"instance:{to_uri(target_instance)}"})
+                    if targets:
+                        entry[to_uri(predicate)] = targets if len(targets) > 1 else targets[0]
+                    break
+
+    return {
+        "@context": {
+            "@vocab": "http://example.org/ontology#",
+            "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+            "instance": "http://example.org/instance/"
+        },
+        "@graph": graph
+    }
+
+
+def from_jsonld_kg(jsonld: dict) -> dict:
+    """Convert JSON-LD knowledge graph back to internal format."""
+    graph = jsonld.get("@graph", [])
+
+    instances = {}
+    relationships = {}
+
+    # First pass: extract instances
+    uri_to_info = {}  # Maps URI to (class, instance_name)
+    for entry in graph:
+        uri = entry.get("@id", "")
+        class_type = entry.get("@type", "").replace("_", " ")
+        label = entry.get("rdfs:label", uri.split(":")[-1].replace("_", " "))
+
+        if class_type:
+            if class_type not in instances:
+                instances[class_type] = []
+            if label not in instances[class_type]:
+                instances[class_type].append(label)
+            uri_to_info[uri] = (class_type, label)
+
+    # Second pass: extract relationships
+    for entry in graph:
+        source_uri = entry.get("@id", "")
+        source_info = uri_to_info.get(source_uri)
+        if not source_info:
+            continue
+        source_class, source_instance = source_info
+
+        for key, value in entry.items():
+            if key.startswith("@") or key.startswith("rdfs:"):
+                continue
+
+            predicate = key.replace("_", " ")
+            targets = value if isinstance(value, list) else [value]
+
+            for target in targets:
+                if isinstance(target, dict):
+                    target_uri = target.get("@id", "")
+                    target_info = uri_to_info.get(target_uri)
+                    if target_info:
+                        target_class, target_instance = target_info
+                        rel_key = f"{source_class}:{predicate}:{target_class}"
+                        if rel_key not in relationships:
+                            relationships[rel_key] = []
+                        if target_instance not in relationships[rel_key]:
+                            relationships[rel_key].append(target_instance)
+
+    return {"instances": instances, "relationships": relationships}
+
+
 def load_knowledge_graphs(username: str, ontology_id: str) -> list[dict]:
     """Load list of knowledge graphs for a user's ontology."""
     index_file = get_kg_index_file(username, ontology_id)
@@ -916,7 +1184,15 @@ async def load_ontology(username: str, ontology_id: str, _: Annotated[bool, Depe
         return {"meta": meta, "graph": {"nodes": [], "edges": []}}
 
     with open(ontology_file) as f:
-        graph = json.load(f)
+        stored_data = json.load(f)
+
+    # Check if stored as JSON-LD or legacy format
+    if "@context" in stored_data and "@graph" in stored_data:
+        # JSON-LD format - convert to internal format for frontend
+        graph = from_jsonld_ontology(stored_data)
+    else:
+        # Legacy format - use as-is
+        graph = stored_data
 
     return {"meta": meta, "graph": graph}
 
@@ -934,9 +1210,13 @@ async def save_ontology(username: str, ontology_id: str, data: OntologySave, _: 
     if not validate_file_path(ontology_file):
         raise HTTPException(status_code=500, detail="Invalid file path")
 
-    # Save graph data
+    # Convert to JSON-LD format for storage
+    internal_format = data.graph.model_dump()
+    jsonld_format = to_jsonld_ontology(internal_format, data.name)
+
+    # Save as JSON-LD
     with open(ontology_file, "w") as f:
-        json.dump(data.graph.model_dump(), f, indent=2)
+        json.dump(jsonld_format, f, indent=2)
 
     # Update metadata
     ontologies[meta_idx]["name"] = data.name
@@ -1047,24 +1327,32 @@ async def get_knowledge_graph(username: str, ontology_id: str, kg_id: str, _: An
     # Verify ownership
     if not verify_ontology_ownership(username, ontology_id):
         raise HTTPException(status_code=404, detail="Ontology not found")
-    
+
     # Verify knowledge graph exists and belongs to this ontology
     kgs = load_knowledge_graphs(username, ontology_id)
     meta = next((kg for kg in kgs if kg["id"] == kg_id), None)
     if not meta:
         raise HTTPException(status_code=404, detail="Knowledge graph not found")
-    
+
     # Load the knowledge graph data
     kg_file = get_kg_file(kg_id)
     if not validate_file_path(kg_file):
         raise HTTPException(status_code=500, detail="Invalid file path")
-    
+
     if not kg_file.exists():
-        return {"meta": meta, "data": {}}
-    
+        return {"meta": meta, "data": {"instances": {}, "relationships": {}}}
+
     with open(kg_file) as f:
-        kg_data = json.load(f)
-    
+        stored_data = json.load(f)
+
+    # Check if stored as JSON-LD or legacy format
+    if "@context" in stored_data and "@graph" in stored_data:
+        # JSON-LD format - convert to internal format for frontend
+        kg_data = from_jsonld_kg(stored_data)
+    else:
+        # Legacy format - use as-is
+        kg_data = stored_data
+
     return {"meta": meta, "data": kg_data}
 
 
@@ -1074,25 +1362,28 @@ async def update_knowledge_graph(username: str, ontology_id: str, kg_id: str, da
     # Verify ownership
     if not verify_ontology_ownership(username, ontology_id):
         raise HTTPException(status_code=404, detail="Ontology not found")
-    
+
     # Verify knowledge graph exists and belongs to this ontology
     kgs = load_knowledge_graphs(username, ontology_id)
     meta_idx = next((i for i, kg in enumerate(kgs) if kg["id"] == kg_id), None)
     if meta_idx is None:
         raise HTTPException(status_code=404, detail="Knowledge graph not found")
-    
+
     # Verify the IDs match
     if data.id != kg_id:
         raise HTTPException(status_code=400, detail="Knowledge graph ID mismatch")
-    
+
     # Save knowledge graph data
     kg_file = get_kg_file(kg_id)
     if not validate_file_path(kg_file):
         raise HTTPException(status_code=500, detail="Invalid file path")
-    
+
+    # Convert to JSON-LD format for storage
+    jsonld_format = to_jsonld_kg(data.data)
+
     with open(kg_file, "w") as f:
-        json.dump(data.data, f, indent=2)
-    
+        json.dump(jsonld_format, f, indent=2)
+
     # Update metadata
     kgs[meta_idx]["name"] = data.name
     kgs[meta_idx]["updated_at"] = datetime.utcnow().isoformat()

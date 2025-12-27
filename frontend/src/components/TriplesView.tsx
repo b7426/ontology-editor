@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import type { Node, Edge } from 'reactflow';
+import type { Node, Edge } from '../types';
 import { API_URL, apiHeaders } from '../utils/api';
 
 interface TriplesViewProps {
@@ -15,7 +15,7 @@ interface NodeGroup {
   nodeId: string;
   label: string;
   depth: number;
-  properties: { predicate: string; object: string }[];
+  properties: { predicate: string; object: string; depth: number; childNodeId?: string }[];
 }
 
 function buildHierarchy(nodes: Node[], edges: Edge[]): NodeGroup[] {
@@ -39,55 +39,76 @@ function buildHierarchy(nodes: Node[], edges: Edge[]): NodeGroup[] {
   // Find root nodes (nodes that are not children of any other node)
   const roots = nodes.filter((n) => !parents.has(n.id));
 
-  // Build ordered list with depths using DFS
+  // Build ordered list - only root nodes get their own group
+  // Child nodes appear as properties of their parents
   const result: NodeGroup[] = [];
   const visited = new Set<string>();
 
-  function visit(nodeId: string, depth: number) {
-    if (visited.has(nodeId)) return;
-    visited.add(nodeId);
+  function collectProperties(nodeId: string, depth: number): { predicate: string; object: string; depth: number; childNodeId?: string }[] {
+    const properties: { predicate: string; object: string; depth: number; childNodeId?: string }[] = [];
 
-    const node = nodes.find((n) => n.id === nodeId);
-    if (!node) return;
-
-    const label = node.data.label || node.id;
-
-    // Collect all properties for this node (rdf:type owl:Class is shown on the subject line)
-    const attributes: { predicate: string; object: string }[] = [];
-    const relationships: { predicate: string; object: string }[] = [];
-
-    // Add edges where this node is the source (excluding subClassOf since hierarchy is shown via indentation)
+    // Add non-subClassOf edges where this node is the source
     edges.forEach((edge) => {
       if (edge.source === nodeId) {
         const predicate = typeof edge.label === 'string' ? edge.label : 'relatedTo';
-        if (predicate === 'subClassOf') return; // Skip subClassOf - already shown via hierarchy
+        if (predicate === 'subClassOf') return; // Handle subClassOf separately
         const targetNode = nodes.find((n) => n.id === edge.target);
         if (targetNode) {
-          relationships.push({
+          properties.push({
             predicate,
             object: targetNode.data.label || targetNode.id,
+            depth,
           });
         }
       }
     });
 
-    // Combine: attributes first, then relationships
-    const properties = [...attributes, ...relationships];
-
-    result.push({ nodeId, label, depth, properties });
-
-    // Visit children
+    // Add children as subClassOf properties, then recursively add their properties
     const nodeChildren = children.get(nodeId) || [];
-    nodeChildren.forEach((childId) => visit(childId, depth + 1));
+    nodeChildren.forEach((childId) => {
+      if (visited.has(childId)) return;
+      visited.add(childId);
+
+      const childNode = nodes.find((n) => n.id === childId);
+      if (childNode) {
+        const childLabel = childNode.data.label || childNode.id;
+        // Add the child as a subClassOf property
+        properties.push({
+          predicate: 'subClassOf',
+          object: childLabel,
+          depth,
+          childNodeId: childId,
+        });
+        // Recursively add the child's properties (indented further)
+        const childProps = collectProperties(childId, depth + 1);
+        properties.push(...childProps);
+      }
+    });
+
+    return properties;
   }
 
-  // Visit all roots first
-  roots.forEach((root) => visit(root.id, 0));
+  // Visit all roots
+  roots.forEach((root) => {
+    if (visited.has(root.id)) return;
+    visited.add(root.id);
 
-  // Visit any unvisited nodes (disconnected)
+    const node = nodes.find((n) => n.id === root.id);
+    if (!node) return;
+
+    const label = node.data.label || node.id;
+    const properties = collectProperties(root.id, 0);
+
+    result.push({ nodeId: root.id, label, depth: 0, properties });
+  });
+
+  // Visit any unvisited nodes (disconnected - treat as roots)
   nodes.forEach((node) => {
     if (!visited.has(node.id)) {
-      visit(node.id, 0);
+      visited.add(node.id);
+      const label = node.data.label || node.id;
+      const properties = collectProperties(node.id, 0);
+      result.push({ nodeId: node.id, label, depth: 0, properties });
     }
   });
 
@@ -332,26 +353,27 @@ export default function TriplesView({ nodes, edges, selectedKnowledgeGraphId, on
     }
   };
 
-  const rows: { subject: string; predicate: string; object: string; depth: number; isFirst: boolean; nodeId?: string }[] = [];
+  const rows: { subject: string; predicate: string; object: string; depth: number; isFirst: boolean; nodeId?: string; childNodeId?: string }[] = [];
 
   hierarchy.forEach((group) => {
-    // Always add the subject row
+    // Add the subject row (only for root nodes)
     rows.push({
       subject: group.label,
       predicate: '',
       object: '',
-      depth: group.depth,
+      depth: 0,
       isFirst: true,
       nodeId: group.nodeId,
     });
-    // Add property rows
+    // Add property rows with their own depth
     group.properties.forEach((prop) => {
       rows.push({
         subject: group.label,
         predicate: prop.predicate,
         object: prop.object,
-        depth: group.depth,
+        depth: prop.depth,
         isFirst: false,
+        childNodeId: prop.childNodeId,
       });
     });
   });
@@ -383,10 +405,7 @@ export default function TriplesView({ nodes, edges, selectedKnowledgeGraphId, on
               >
                 {row.isFirst ? (
                   <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                    <span>
-                      {row.depth > 0 && <span style={{ color: '#94a3b8', marginRight: '8px' }}>└</span>}
-                      {row.subject}
-                    </span>
+                    <span>{row.subject}</span>
                     <button
                       onClick={() => setSelectedNodeId(row.nodeId || null)}
                       style={{
@@ -413,7 +432,7 @@ export default function TriplesView({ nodes, edges, selectedKnowledgeGraphId, on
                     />
                   </div>
                 ) : (
-                  <span style={{ paddingLeft: '20px' }}>
+                  <span>
                     <span style={{ color: '#059669' }}>{row.predicate}</span>
                     {' '}
                     <span style={{ color: '#6366f1' }}>{row.object}</span>
@@ -444,18 +463,40 @@ export default function TriplesView({ nodes, edges, selectedKnowledgeGraphId, on
                       }}
                     />
                   ) : (() => {
-                    // For property rows, check if the object is a class
+                    // For subClassOf rows, show instance input for that child class
+                    if (row.predicate === 'subClassOf' && row.childNodeId) {
+                      const childClass = row.object;
+                      return (
+                        <input
+                          type="text"
+                          value={inputValues[childClass] || ''}
+                          onChange={(e) => handleValueChange(childClass, e.target.value)}
+                          onBlur={() => handleValueBlur(childClass)}
+                          placeholder="Enter instances (comma-separated)..."
+                          style={{
+                            width: '100%',
+                            padding: '6px 8px',
+                            border: '1px solid #cbd5e1',
+                            borderRadius: '4px',
+                            fontSize: '13px',
+                            fontFamily: 'inherit',
+                          }}
+                        />
+                      );
+                    }
+
+                    // For other property rows, check if the object is a class with instances
                     const targetClass = row.object;
                     const relationshipKey = `${row.subject}:${row.predicate}:${targetClass}`;
                     const isClass = isClassInOntology(targetClass);
-                    
-                    // Only show dropdown if target is a class
+
+                    // Only show dropdown if target is a class in the ontology
                     if (!isClass) {
                       return <span style={{ color: '#94a3b8', fontSize: '12px' }}>—</span>;
                     }
 
                     const availableInstances = getInstancesForClass(targetClass);
-                    
+
                     if (availableInstances.length > 0) {
                       // Get currently selected instances to filter them out
                       const currentSelected = (relationshipValues[relationshipKey] || '')
@@ -524,6 +565,33 @@ export default function TriplesView({ nodes, edges, selectedKnowledgeGraphId, on
               )}
             </tr>
           ))}
+          {/* Classes row */}
+          <tr style={{ backgroundColor: '#f8fafc' }}>
+            <td
+              colSpan={selectedKnowledgeGraphId ? 2 : 1}
+              style={{
+                padding: '12px',
+                borderTop: '2px solid #e2e8f0',
+                borderBottom: '1px solid #e2e8f0',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+                <span style={{ fontWeight: 600, color: '#475569' }}>Classes:</span>
+                {nodes.map((node, idx) => (
+                  <span
+                    key={node.id}
+                    style={{
+                      color: '#6366f1',
+                      fontWeight: 500,
+                    }}
+                  >
+                    {node.data.label || node.id}
+                    {idx < nodes.length - 1 && <span style={{ color: '#94a3b8', marginLeft: '8px' }}>,</span>}
+                  </span>
+                ))}
+              </div>
+            </td>
+          </tr>
         </tbody>
       </table>
       {rows.length === 0 && (
@@ -532,7 +600,7 @@ export default function TriplesView({ nodes, edges, selectedKnowledgeGraphId, on
         </div>
       )}
       <div style={{ marginTop: '20px', padding: '12px', backgroundColor: '#f1f5f9', borderRadius: '6px', fontSize: '14px', color: '#64748b' }}>
-        Total: {rows.length} triples ({nodes.length} nodes, {edges.length} edges)
+        Total: {rows.length} triples ({nodes.length} classes, {edges.length} relationships)
       </div>
 
       {/* Node Info Popup */}

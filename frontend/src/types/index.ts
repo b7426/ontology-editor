@@ -3,6 +3,43 @@
  */
 
 /**
+ * Graph node position
+ */
+export interface Position {
+  x: number;
+  y: number;
+}
+
+/**
+ * Graph node data
+ */
+export interface NodeData {
+  label?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * Graph node
+ */
+export interface Node {
+  id: string;
+  type?: string;
+  position: Position;
+  data: NodeData;
+}
+
+/**
+ * Graph edge
+ */
+export interface Edge {
+  id: string;
+  source: string;
+  target: string;
+  label?: string;
+  type?: string;
+}
+
+/**
  * Ontology metadata
  */
 export interface OntologyMeta {
@@ -75,8 +112,8 @@ export interface HealthResponse {
  * Graph data structure
  */
 export interface GraphData {
-  nodes: import('reactflow').Node[];
-  edges: import('reactflow').Edge[];
+  nodes: Node[];
+  edges: Edge[];
 }
 
 /**

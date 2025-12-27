@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import type { Node, Edge } from 'reactflow';
+import type { Node, Edge } from '../types';
 import type { ChatMessage } from '../utils/storage';
 import {
   getChatMessages,
@@ -200,7 +200,6 @@ export default function ChatPanel({ ontologyId, ontologyName, username, nodes, e
             type: 'default',
             position: { x, y },
             data: { label: action.label },
-            style: { background: '#6366f1', color: 'white', border: 'none' },
           };
           newNodes.push(newNode);
 

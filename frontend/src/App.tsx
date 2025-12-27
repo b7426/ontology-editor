@@ -1,5 +1,4 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
-import OntologyGraph from './components/OntologyGraph'
 import TriplesView from './components/TriplesView'
 import ChatPanel from './components/ChatPanel'
 import Admin from './components/Admin'
@@ -8,12 +7,10 @@ import Landing from './components/Landing'
 import LoginModal from './components/LoginModal'
 import KGNameModal from './components/KGNameModal'
 import FileManager from './components/FileManager'
-import JsonView from './components/JsonView'
 import { API_URL, apiHeaders } from './utils/api'
-import type { Node, Edge } from 'reactflow'
-import type { AuthState, OntologyMeta, KnowledgeGraphMeta, KnowledgeGraphsResponse } from './types'
+import type { Node, Edge, AuthState, OntologyMeta, KnowledgeGraphMeta, KnowledgeGraphsResponse } from './types'
 
-type TabType = 'file' | 'triples' | 'graph' | 'json' | 'admin' | 'settings'
+type TabType = 'file' | 'triples' | 'admin' | 'settings'
 
 function App() {
   const [backendStatus, setBackendStatus] = useState<'loading' | 'ok' | 'error'>('loading')
@@ -46,6 +43,8 @@ function App() {
   const [knowledgeGraphs, setKnowledgeGraphs] = useState<KnowledgeGraphMeta[]>([])
   const [selectedKnowledgeGraph, setSelectedKnowledgeGraph] = useState<string | null>(null)
   const [showKGNameModal, setShowKGNameModal] = useState(false)
+  const [showJsonModal, setShowJsonModal] = useState(false)
+  const [jsonModalData, setJsonModalData] = useState<{ title: string; json: string } | null>(null)
 
   useEffect(() => {
     fetch(`${API_URL}/health`, { headers: apiHeaders() })
@@ -178,7 +177,7 @@ function App() {
     setCurrentOntology(ontology)
     setNodes([])
     setEdges([])
-    setActiveTab('graph')
+    setActiveTab('triples')
   }
 
   const handleCreateKnowledgeGraphClick = () => {
@@ -233,6 +232,145 @@ function App() {
     }
   }
 
+  const handleShowJson = async () => {
+    if (!currentOntology) return
+
+    // Helper to create safe URI
+    const toUri = (label: string) => label.replace(/\s+/g, '_')
+
+    // Create node ID to label mapping
+    const idToLabel = new Map<string, string>()
+    nodes.forEach((n) => {
+      idToLabel.set(n.id, n.data.label || n.id)
+    })
+
+    if (selectedKnowledgeGraph) {
+      // Show knowledge graph JSON-LD
+      try {
+        const response = await fetch(`${API_URL}/knowledge-graphs/${auth.username}/${currentOntology.id}/${selectedKnowledgeGraph}`, {
+          headers: apiHeaders(),
+        })
+        const kgResponse = await response.json()
+        const kgData = kgResponse.data || { instances: {}, relationships: {} }
+        const kgName = knowledgeGraphs.find(kg => kg.id === selectedKnowledgeGraph)?.name || 'Knowledge Graph'
+
+        // Convert to JSON-LD format
+        const graph: Record<string, unknown>[] = []
+        const instances = kgData.instances || {}
+        const relationships = kgData.relationships || {}
+
+        // Create instance entries
+        for (const [className, instanceList] of Object.entries(instances)) {
+          for (const instanceName of (instanceList as string[])) {
+            const entry: Record<string, unknown> = {
+              "@id": `instance:${toUri(instanceName)}`,
+              "@type": toUri(className),
+              "rdfs:label": instanceName
+            }
+            graph.push(entry)
+          }
+        }
+
+        // Add relationships
+        for (const [relKey, relValues] of Object.entries(relationships)) {
+          const parts = relKey.split(':')
+          if (parts.length !== 3) continue
+          const [sourceClass, predicate, targetClass] = parts
+
+          const sourceInstances = instances[sourceClass] || []
+          for (const sourceInstance of (sourceInstances as string[])) {
+            const sourceUri = `instance:${toUri(sourceInstance)}`
+            const entry = graph.find(e => e["@id"] === sourceUri)
+            if (entry) {
+              const targets = (relValues as string[])
+                .filter(t => ((instances[targetClass] || []) as string[]).includes(t))
+                .map(t => ({ "@id": `instance:${toUri(t)}` }))
+              if (targets.length > 0) {
+                entry[toUri(predicate)] = targets.length === 1 ? targets[0] : targets
+              }
+            }
+          }
+        }
+
+        const jsonld = {
+          "@context": {
+            "@vocab": "http://example.org/ontology#",
+            "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+            "instance": "http://example.org/instance/"
+          },
+          "@graph": graph
+        }
+
+        setJsonModalData({
+          title: `${kgName} (Knowledge Graph)`,
+          json: JSON.stringify(jsonld, null, 2)
+        })
+      } catch (error) {
+        console.error('Failed to load knowledge graph:', error)
+        return
+      }
+    } else {
+      // Show ontology JSON-LD
+      const graph: Record<string, unknown>[] = []
+
+      // Add classes
+      for (const node of nodes) {
+        const label = node.data.label || node.id
+        const classEntry: Record<string, unknown> = {
+          "@id": toUri(label),
+          "@type": "owl:Class",
+          "rdfs:label": label
+        }
+        graph.push(classEntry)
+      }
+
+      // Add relationships
+      for (const edge of edges) {
+        const sourceLabel = idToLabel.get(edge.source) || edge.source
+        const targetLabel = idToLabel.get(edge.target) || edge.target
+        const predicate = typeof edge.label === 'string' ? edge.label : 'relatedTo'
+
+        if (predicate === 'subClassOf') {
+          // Add subClassOf to the class entry
+          const entry = graph.find(e => e["@id"] === toUri(sourceLabel))
+          if (entry) {
+            entry["rdfs:subClassOf"] = { "@id": toUri(targetLabel) }
+          }
+        } else {
+          // Add as object property
+          const existing = graph.find(e => e["@id"] === toUri(predicate) && e["@type"] === "owl:ObjectProperty")
+          if (!existing) {
+            graph.push({
+              "@id": toUri(predicate),
+              "@type": "owl:ObjectProperty",
+              "rdfs:domain": { "@id": toUri(sourceLabel) },
+              "rdfs:range": { "@id": toUri(targetLabel) }
+            })
+          }
+        }
+      }
+
+      const jsonld = {
+        "@context": {
+          "@vocab": "http://example.org/ontology#",
+          "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+          "owl": "http://www.w3.org/2002/07/owl#",
+          "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "@id": toUri(currentOntology.name),
+        "@type": "owl:Ontology",
+        "rdfs:label": currentOntology.name,
+        "@graph": graph
+      }
+
+      setJsonModalData({
+        title: `${currentOntology.name} (Ontology)`,
+        json: JSON.stringify(jsonld, null, 2)
+      })
+    }
+    setShowJsonModal(true)
+  }
+
   const tabStyle = (tab: TabType) => ({
     padding: '8px 16px',
     backgroundColor: activeTab === tab ? '#6366f1' : 'transparent',
@@ -265,6 +403,119 @@ function App() {
         onClose={() => setShowKGNameModal(false)}
         onConfirm={handleCreateKnowledgeGraph}
       />
+      {/* JSON Modal */}
+      {showJsonModal && jsonModalData && (
+        <>
+          <div
+            style={{
+              position: 'fixed',
+              top: 0,
+              left: 0,
+              right: 0,
+              bottom: 0,
+              backgroundColor: 'rgba(0, 0, 0, 0.5)',
+              zIndex: 1000,
+              cursor: 'pointer',
+            }}
+            onClick={() => setShowJsonModal(false)}
+          />
+          <div
+            style={{
+              position: 'fixed',
+              top: '50%',
+              left: '50%',
+              transform: 'translate(-50%, -50%)',
+              backgroundColor: '#1e293b',
+              borderRadius: '8px',
+              boxShadow: '0 10px 25px rgba(0, 0, 0, 0.3)',
+              zIndex: 1001,
+              width: '80%',
+              maxWidth: '800px',
+              maxHeight: '80vh',
+              display: 'flex',
+              flexDirection: 'column',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ padding: '16px 20px', borderBottom: '1px solid #334155', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h3 style={{ margin: 0, fontSize: '16px', fontWeight: 600, color: '#f1f5f9' }}>
+                {jsonModalData.title}
+              </h3>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button
+                  onClick={() => {
+                    navigator.clipboard.writeText(jsonModalData.json)
+                    alert('Copied to clipboard!')
+                  }}
+                  style={{
+                    padding: '6px 12px',
+                    backgroundColor: '#6366f1',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '4px',
+                    cursor: 'pointer',
+                    fontSize: '13px',
+                  }}
+                >
+                  Copy
+                </button>
+                <button
+                  onClick={() => {
+                    const blob = new Blob([jsonModalData.json], { type: 'application/json' })
+                    const url = URL.createObjectURL(blob)
+                    const a = document.createElement('a')
+                    a.href = url
+                    a.download = `${jsonModalData.title.replace(/[^a-zA-Z0-9]/g, '_')}.json`
+                    document.body.appendChild(a)
+                    a.click()
+                    document.body.removeChild(a)
+                    URL.revokeObjectURL(url)
+                  }}
+                  style={{
+                    padding: '6px 12px',
+                    backgroundColor: '#059669',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '4px',
+                    cursor: 'pointer',
+                    fontSize: '13px',
+                  }}
+                >
+                  Download
+                </button>
+                <button
+                  onClick={() => setShowJsonModal(false)}
+                  style={{
+                    background: 'none',
+                    border: 'none',
+                    fontSize: '20px',
+                    cursor: 'pointer',
+                    color: '#94a3b8',
+                    padding: '0 4px',
+                  }}
+                >
+                  ×
+                </button>
+              </div>
+            </div>
+            <div style={{ flex: 1, overflow: 'auto', padding: '16px 20px' }}>
+              <pre
+                style={{
+                  margin: 0,
+                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+                  fontSize: '13px',
+                  lineHeight: 1.6,
+                  color: '#e2e8f0',
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                }}
+              >
+                {jsonModalData.json}
+              </pre>
+            </div>
+          </div>
+        </>
+      )}
       <div style={{ width: '100vw', height: '100vh', display: 'flex', flexDirection: 'column' }}>
         <header style={{
         backgroundColor: '#1e293b',
@@ -307,12 +558,6 @@ function App() {
           <button style={tabStyle('triples')} onClick={() => setActiveTab('triples')}>
             Triples
           </button>
-          <button style={tabStyle('graph')} onClick={() => setActiveTab('graph')}>
-            Graph
-          </button>
-          <button style={tabStyle('json')} onClick={() => setActiveTab('json')}>
-            JSON
-          </button>
         </div>
         <div>
           {auth.isAdmin && (
@@ -339,31 +584,31 @@ function App() {
             <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
               {currentOntology && (
                 <div style={{ padding: '12px 20px', backgroundColor: '#ffffff', borderBottom: '1px solid #e2e8f0', display: 'flex', alignItems: 'center', gap: '12px', justifyContent: 'space-between' }}>
-                  <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '14px', fontWeight: 500, color: '#1e293b' }}>
-                    <span>Knowledge Graph:</span>
-                    <select
-                      value={selectedKnowledgeGraph || ''}
-                      onChange={(e) => setSelectedKnowledgeGraph(e.target.value || null)}
-                      style={{
-                        padding: '6px 12px',
-                        border: '1px solid #cbd5e1',
-                        borderRadius: '6px',
-                        fontSize: '14px',
-                        backgroundColor: '#ffffff',
-                        color: '#1e293b',
-                        cursor: 'pointer',
-                        minWidth: '200px',
-                      }}
-                    >
-                      <option value="">None (use ontology graph)</option>
-                      {knowledgeGraphs.map((kg) => (
-                        <option key={kg.id} value={kg.id}>
-                          {kg.name}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '14px', fontWeight: 500, color: '#1e293b' }}>
+                      <span>Knowledge Graph:</span>
+                      <select
+                        value={selectedKnowledgeGraph || ''}
+                        onChange={(e) => setSelectedKnowledgeGraph(e.target.value || null)}
+                        style={{
+                          padding: '6px 12px',
+                          border: '1px solid #cbd5e1',
+                          borderRadius: '6px',
+                          fontSize: '14px',
+                          backgroundColor: '#ffffff',
+                          color: '#1e293b',
+                          cursor: 'pointer',
+                          minWidth: '200px',
+                        }}
+                      >
+                        <option value="">None (use ontology graph)</option>
+                        {knowledgeGraphs.map((kg) => (
+                          <option key={kg.id} value={kg.id}>
+                            {kg.name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
                     <button
                       onClick={handleCreateKnowledgeGraphClick}
                       style={{
@@ -384,7 +629,31 @@ function App() {
                         e.currentTarget.style.backgroundColor = '#6366f1'
                       }}
                     >
-                      Add
+                      Add Knowledge Graph Instance
+                    </button>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <button
+                      onClick={handleShowJson}
+                      style={{
+                        padding: '6px 12px',
+                        backgroundColor: '#475569',
+                        color: 'white',
+                        border: 'none',
+                        borderRadius: '6px',
+                        fontSize: '14px',
+                        fontWeight: 500,
+                        cursor: 'pointer',
+                        transition: 'background-color 0.2s',
+                      }}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.style.backgroundColor = '#334155'
+                      }}
+                      onMouseLeave={(e) => {
+                        e.currentTarget.style.backgroundColor = '#475569'
+                      }}
+                    >
+                      Show JSON
                     </button>
                     <button
                       onClick={() => {
@@ -459,20 +728,6 @@ function App() {
               onGraphUpdate={handleGraphChange}
             />
           </>
-        )}
-        {activeTab === 'graph' && (
-          <OntologyGraph
-            onGraphChange={handleGraphChange}
-            currentOntology={currentOntology}
-            username={auth.username}
-          />
-        )}
-        {activeTab === 'json' && (
-          <JsonView
-            nodes={nodes}
-            edges={edges}
-            ontologyName={currentOntology?.name}
-          />
         )}
         {activeTab === 'admin' && auth.isAdmin && auth.username && <Admin adminUser={auth.username} />}
         {activeTab === 'settings' && <Settings />}

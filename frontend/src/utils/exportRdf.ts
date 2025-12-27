@@ -1,4 +1,4 @@
-import type { Node, Edge } from 'reactflow';
+import type { Node, Edge } from '../types';
 
 export function generateTurtle(nodes: Node[], edges: Edge[]): string {
   const lines: string[] = [];
