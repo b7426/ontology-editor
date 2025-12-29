@@ -3,14 +3,6 @@
  */
 
 /**
- * Graph node position
- */
-export interface Position {
-  x: number;
-  y: number;
-}
-
-/**
  * Graph node data
  */
 export interface NodeData {
@@ -24,19 +16,21 @@ export interface NodeData {
 export interface Node {
   id: string;
   type?: string;
-  position: Position;
   data: NodeData;
 }
 
 /**
  * Graph edge
+ * For object properties: source -> target (both are class nodes)
+ * For datatype properties: source only, with datatype field (e.g., "string", "integer")
  */
 export interface Edge {
   id: string;
   source: string;
-  target: string;
+  target?: string;  // Optional for datatype properties
   label?: string;
   type?: string;
+  datatype?: string;  // For datatype properties (e.g., "string", "integer", "date")
 }
 
 /**

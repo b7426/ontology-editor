@@ -22,11 +22,20 @@ interface ChatPanelProps {
 }
 
 interface ChatAction {
-  action: 'add_node' | 'remove_node' | 'add_edge' | 'remove_edge';
+  action: 'add_node' | 'remove_node' | 'add_edge' | 'remove_edge' | 'add_property';
   label?: string;
   parent?: string;
   source?: string;
   target?: string;
+  class?: string;
+  property?: string;
+}
+
+interface LogEntry {
+  id: string;
+  type: 'request' | 'response' | 'db_update';
+  timestamp: number;
+  data: unknown;
 }
 
 export default function ChatPanel({ ontologyId, ontologyName, username, nodes, edges, onGraphUpdate }: ChatPanelProps) {
@@ -35,8 +44,20 @@ export default function ChatPanel({ ontologyId, ontologyName, username, nodes, e
   const [isLoading, setIsLoading] = useState(false);
   const [panelWidth, setPanelWidth] = useState(getChatPanelWidth);
   const [isResizing, setIsResizing] = useState(false);
+  const [showLog, setShowLog] = useState(false);
+  const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
+  const [debugMode, setDebugMode] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+
+  const addLogEntry = (type: LogEntry['type'], data: unknown) => {
+    setLogEntries(prev => [...prev, {
+      id: `log-${Date.now()}-${Math.random()}`,
+      type,
+      timestamp: Date.now(),
+      data,
+    }]);
+  };
 
   // Keep refs to latest nodes/edges to avoid stale closures in async callbacks
   const nodesRef = useRef(nodes);
@@ -176,29 +197,9 @@ export default function ChatPanel({ ontologyId, ontologyName, username, nodes, e
           const existingNode = newNodes.find(n => n.data.label === action.label);
           if (existingNode) break;
 
-          // Find position (place below parent or at bottom)
-          let y = 150;
-          let x = 50;
-          if (action.parent) {
-            const parentNode = newNodes.find(n => n.data.label === action.parent);
-            if (parentNode) {
-              y = parentNode.position.y + 120;
-              x = parentNode.position.x;
-            }
-          } else {
-            // Find max y position
-            const maxY = Math.max(...newNodes.map(n => n.position.y), 0);
-            y = maxY + 120;
-          }
-          // Avoid overlap
-          while (newNodes.some(n => Math.abs(n.position.x - x) < 50 && Math.abs(n.position.y - y) < 50)) {
-            x += 180;
-          }
-
           const newNode: Node = {
             id: `node-${Date.now()}`,
             type: 'default',
-            position: { x, y },
             data: { label: action.label },
           };
           newNodes.push(newNode);
@@ -259,6 +260,38 @@ export default function ChatPanel({ ontologyId, ontologyName, username, nodes, e
           );
           break;
         }
+
+        case 'add_property': {
+          if (!action.class || !action.property) break;
+          const classNode = newNodes.find(n => n.data.label === action.class);
+          if (!classNode) break;
+
+          // Find or create the String datatype node
+          let stringNode = newNodes.find(n => n.data.label === 'String');
+          if (!stringNode) {
+            stringNode = {
+              id: `node-string-${Date.now()}`,
+              type: 'default',
+              data: { label: 'String' },
+            };
+            newNodes.push(stringNode);
+          }
+
+          // Check if this property already exists
+          const existingEdge = newEdges.find(
+            e => e.source === classNode.id && e.label === action.property
+          );
+          if (existingEdge) break;
+
+          // Add edge from class to String with property name as label
+          newEdges.push({
+            id: `edge-${Date.now()}-${Math.random()}`,
+            source: classNode.id,
+            target: stringNode.id,
+            label: action.property,
+          });
+          break;
+        }
       }
     }
 
@@ -267,17 +300,40 @@ export default function ChatPanel({ ontologyId, ontologyName, username, nodes, e
 
     // Save to backend
     if (ontologyId && username && ontologyName) {
+      const saveData = {
+        id: ontologyId,
+        name: ontologyName,
+        graph: { nodes: newNodes, edges: newEdges }
+      };
+
+      addLogEntry('db_update', {
+        url: `${API_URL}/ontologies/${username}/${ontologyId}`,
+        method: 'PUT',
+        body: saveData,
+        actions: actions,
+      });
+
       fetch(`${API_URL}/ontologies/${username}/${ontologyId}`, {
         method: 'PUT',
         headers: apiHeaders(),
-        body: JSON.stringify({
-          id: ontologyId,
-          name: ontologyName,
-          graph: { nodes: newNodes, edges: newEdges }
-        }),
-      }).catch((error) => {
-        console.error('Failed to save ontology:', error);
-      });
+        body: JSON.stringify(saveData),
+      })
+        .then((res) => res.json())
+        .then((data) => {
+          addLogEntry('response', {
+            type: 'db_save',
+            status: 'success',
+            body: data,
+          });
+        })
+        .catch((error) => {
+          console.error('Failed to save ontology:', error);
+          addLogEntry('response', {
+            type: 'db_save',
+            status: 'error',
+            error: error.message,
+          });
+        });
     }
   };
 
@@ -314,18 +370,29 @@ ${edgeDescriptions || 'none'}
 
 ${systemPrompt}`;
 
+      const requestBody = {
+        messages: [
+          { role: 'system', content: contextPrompt },
+          ...newMessages.filter(m => m.role !== 'system').map(m => ({
+            role: m.role,
+            content: m.content,
+          })),
+        ],
+        ontology_id: ontologyId,
+        username: username,
+        debug_mode: debugMode,
+      };
+
+      addLogEntry('request', {
+        url: `${API_URL}/chat`,
+        method: 'POST',
+        body: requestBody,
+      });
+
       const response = await fetch(`${API_URL}/chat`, {
         method: 'POST',
         headers: apiHeaders(),
-        body: JSON.stringify({
-          messages: [
-            { role: 'system', content: contextPrompt },
-            ...newMessages.filter(m => m.role !== 'system').map(m => ({
-              role: m.role,
-              content: m.content,
-            })),
-          ],
-        }),
+        body: JSON.stringify(requestBody),
       });
 
       if (!response.ok) {
@@ -333,6 +400,11 @@ ${systemPrompt}`;
       }
 
       const data = await response.json();
+
+      addLogEntry('response', {
+        status: response.status,
+        body: data,
+      });
       const assistantMessage: ChatMessage = {
         id: `assistant-${Date.now()}`,
         role: 'assistant',
@@ -344,10 +416,23 @@ ${systemPrompt}`;
       setMessages(updatedMessages);
       saveChatMessages(ontologyId, updatedMessages);
 
-      // Apply any actions in the response
-      const actions = extractActions(data.content);
-      if (actions.length > 0) {
-        applyActions(actions);
+      // Use updated_graph from backend if available (backend handles action parsing/applying)
+      if (data.updated_graph) {
+        addLogEntry('db_update', {
+          source: 'backend',
+          applied_actions: data.applied_actions || [],
+          updated_graph: data.updated_graph,
+        });
+        // Convert backend graph format to frontend nodes/edges
+        const backendNodes = data.updated_graph.nodes || [];
+        const backendEdges = data.updated_graph.edges || [];
+        onGraphUpdate(backendNodes, backendEdges);
+      } else {
+        // Fallback: parse and apply actions locally if backend didn't handle it
+        const actions = extractActions(data.content);
+        if (actions.length > 0) {
+          applyActions(actions);
+        }
       }
     } catch (error) {
       console.error('Chat error:', error);
@@ -455,20 +540,74 @@ ${systemPrompt}`;
         <span style={{ fontWeight: 600, color: '#1e293b', fontSize: '14px' }}>
           Ontology Assistant
         </span>
-        <button
-          onClick={handleClearChat}
-          style={{
-            padding: '4px 8px',
-            backgroundColor: 'transparent',
-            color: '#64748b',
-            border: '1px solid #e2e8f0',
-            borderRadius: '4px',
-            cursor: 'pointer',
-            fontSize: '12px',
-          }}
-        >
-          Clear
-        </button>
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+          <label
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              fontSize: '12px',
+              color: '#64748b',
+              cursor: 'pointer',
+            }}
+          >
+            <div
+              onClick={() => setDebugMode(!debugMode)}
+              style={{
+                width: '36px',
+                height: '20px',
+                backgroundColor: debugMode ? '#6366f1' : '#cbd5e1',
+                borderRadius: '10px',
+                position: 'relative',
+                transition: 'background-color 0.2s',
+                cursor: 'pointer',
+              }}
+            >
+              <div
+                style={{
+                  position: 'absolute',
+                  top: '2px',
+                  left: debugMode ? '18px' : '2px',
+                  width: '16px',
+                  height: '16px',
+                  backgroundColor: 'white',
+                  borderRadius: '50%',
+                  transition: 'left 0.2s',
+                  boxShadow: '0 1px 2px rgba(0,0,0,0.2)',
+                }}
+              />
+            </div>
+            Debug
+          </label>
+          <button
+            onClick={() => setShowLog(true)}
+            style={{
+              padding: '4px 8px',
+              backgroundColor: 'transparent',
+              color: '#64748b',
+              border: '1px solid #e2e8f0',
+              borderRadius: '4px',
+              cursor: 'pointer',
+              fontSize: '12px',
+            }}
+          >
+            View Log
+          </button>
+          <button
+            onClick={handleClearChat}
+            style={{
+              padding: '4px 8px',
+              backgroundColor: 'transparent',
+              color: '#64748b',
+              border: '1px solid #e2e8f0',
+              borderRadius: '4px',
+              cursor: 'pointer',
+              fontSize: '12px',
+            }}
+          >
+            Clear
+          </button>
+        </div>
       </div>
 
       {/* Messages */}
@@ -546,11 +685,11 @@ ${systemPrompt}`;
               border: '1px solid #e2e8f0',
               fontSize: '14px',
               resize: 'none',
-              minHeight: '40px',
               maxHeight: '120px',
               fontFamily: 'inherit',
-            }}
-            rows={1}
+              fieldSizing: 'content',
+              minHeight: '2lh',
+            } as React.CSSProperties}
           />
           <button
             onClick={handleSend}
@@ -570,6 +709,120 @@ ${systemPrompt}`;
           </button>
         </div>
       </div>
+
+      {/* Log Overlay */}
+      {showLog && (
+        <>
+          <div
+            style={{
+              position: 'fixed',
+              top: 0,
+              left: 0,
+              right: 0,
+              bottom: 0,
+              backgroundColor: 'rgba(0, 0, 0, 0.5)',
+              zIndex: 1000,
+            }}
+            onClick={() => setShowLog(false)}
+          />
+          <div
+            style={{
+              position: 'fixed',
+              top: '50%',
+              left: '50%',
+              transform: 'translate(-50%, -50%)',
+              backgroundColor: '#1e293b',
+              borderRadius: '8px',
+              padding: '20px',
+              boxShadow: '0 10px 25px rgba(0, 0, 0, 0.3)',
+              zIndex: 1001,
+              width: '80%',
+              maxWidth: '800px',
+              maxHeight: '80vh',
+              display: 'flex',
+              flexDirection: 'column',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+              <h3 style={{ margin: 0, fontSize: '16px', fontWeight: 600, color: '#f1f5f9' }}>
+                Chat Log
+              </h3>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button
+                  onClick={() => setLogEntries([])}
+                  style={{
+                    padding: '4px 12px',
+                    backgroundColor: '#475569',
+                    color: '#f1f5f9',
+                    border: 'none',
+                    borderRadius: '4px',
+                    cursor: 'pointer',
+                    fontSize: '12px',
+                  }}
+                >
+                  Clear Log
+                </button>
+                <button
+                  onClick={() => setShowLog(false)}
+                  style={{
+                    background: 'none',
+                    border: 'none',
+                    fontSize: '20px',
+                    cursor: 'pointer',
+                    color: '#94a3b8',
+                    padding: '0',
+                    width: '24px',
+                    height: '24px',
+                  }}
+                >
+                  ×
+                </button>
+              </div>
+            </div>
+            <div
+              style={{
+                flex: 1,
+                overflow: 'auto',
+                fontFamily: 'monospace',
+                fontSize: '12px',
+                backgroundColor: '#0f172a',
+                borderRadius: '4px',
+                padding: '12px',
+              }}
+            >
+              {logEntries.length === 0 ? (
+                <div style={{ color: '#64748b', textAlign: 'center', padding: '20px' }}>
+                  No log entries yet. Send a message to see the request/response logs.
+                </div>
+              ) : (
+                logEntries.map((entry) => (
+                  <div key={entry.id} style={{ marginBottom: '16px' }}>
+                    <div style={{
+                      color: entry.type === 'request' ? '#22d3ee' : entry.type === 'response' ? '#4ade80' : '#fbbf24',
+                      fontWeight: 600,
+                      marginBottom: '4px',
+                    }}>
+                      [{new Date(entry.timestamp).toLocaleTimeString()}] {entry.type.toUpperCase()}
+                    </div>
+                    <pre style={{
+                      margin: 0,
+                      color: '#e2e8f0',
+                      whiteSpace: 'pre-wrap',
+                      wordBreak: 'break-word',
+                      backgroundColor: '#1e293b',
+                      padding: '8px',
+                      borderRadius: '4px',
+                    }}>
+                      {JSON.stringify(entry.data, null, 2)}
+                    </pre>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }

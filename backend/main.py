@@ -2,6 +2,7 @@ import json
 import os
 import hashlib
 import secrets
+import uuid
 from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
@@ -12,6 +13,19 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 from typing import Annotated
 from openai import OpenAI
+
+# GraphDB service import
+import graphdb_service as gdb
+
+# Server boot ID - changes on each restart, used to invalidate client sessions
+SERVER_BOOT_ID = str(uuid.uuid4())
+
+
+def use_graphdb() -> bool:
+    """Check if GraphDB should be used (available and enabled)."""
+    if os.getenv("STORAGE_BACKEND", "graphdb") == "file":
+        return False
+    return gdb.is_graphdb_available()
 
 
 # Rate limiting for login endpoint
@@ -208,7 +222,6 @@ class Node(BaseModel):
 
     id: str
     type: str | None = "default"
-    position: NodePosition
     data: NodeData
     style: dict | None = None
 
@@ -232,12 +245,13 @@ class Edge(BaseModel):
 
     id: str
     source: str
-    target: str
+    target: str | None = None  # Optional for datatype properties
     label: str | None = None
     animated: bool | None = None
     style: dict | None = None
+    datatype: str | None = None  # For datatype properties (e.g., "string", "integer")
 
-    @field_validator("id", "source", "target")
+    @field_validator("id", "source")
     @classmethod
     def validate_edge_ids(cls, v: str) -> str:
         if len(v) > MAX_ID_LENGTH:
@@ -304,7 +318,7 @@ class LoginResponse(BaseModel):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok"}
+    return {"status": "ok", "server_id": SERVER_BOOT_ID}
 
 
 @app.post("/login", response_model=LoginResponse)
@@ -607,38 +621,67 @@ def to_jsonld_ontology(internal_format: dict, ontology_name: str = "Ontology") -
             "@type": "owl:Class",
             "rdfs:label": label
         }
-        # Store position as custom property for round-trip
-        if "position" in node:
-            class_entry["_position"] = node["position"]
         if "id" in node:
             class_entry["_nodeId"] = node["id"]
         graph.append(class_entry)
 
+    # Map common datatype names to XSD types
+    datatype_map = {
+        "string": "xsd:string",
+        "integer": "xsd:integer",
+        "int": "xsd:integer",
+        "float": "xsd:float",
+        "double": "xsd:double",
+        "boolean": "xsd:boolean",
+        "bool": "xsd:boolean",
+        "date": "xsd:date",
+        "datetime": "xsd:dateTime",
+        "time": "xsd:time",
+    }
+
     # Add properties/relationships
     for edge in edges:
         source_label = id_to_label.get(edge.get("source"), edge.get("source"))
-        target_label = id_to_label.get(edge.get("target"), edge.get("target"))
         predicate = edge.get("label", "relatedTo")
+        datatype = edge.get("datatype")
 
         if predicate == "subClassOf":
             # Add subClassOf to the class entry
+            target_label = id_to_label.get(edge.get("target"), edge.get("target"))
             for entry in graph:
                 if entry.get("@id") == to_uri(source_label):
                     entry["rdfs:subClassOf"] = {"@id": to_uri(target_label)}
                     break
-        else:
-            # Add as object property
+        elif datatype:
+            # Datatype property
+            xsd_type = datatype_map.get(datatype.lower(), f"xsd:{datatype}")
             prop_entry = {
                 "@id": to_uri(predicate),
-                "@type": "owl:ObjectProperty",
+                "@type": "owl:DatatypeProperty",
                 "rdfs:domain": {"@id": to_uri(source_label)},
-                "rdfs:range": {"@id": to_uri(target_label)},
-                "_edgeId": edge.get("id")
+                "rdfs:range": {"@id": xsd_type},
+                "_edgeId": edge.get("id"),
+                "_datatype": datatype  # Preserve original datatype for round-trip
             }
             # Avoid duplicate properties
-            existing = next((e for e in graph if e.get("@id") == to_uri(predicate) and e.get("@type") == "owl:ObjectProperty"), None)
+            existing = next((e for e in graph if e.get("@id") == to_uri(predicate) and e.get("@type") == "owl:DatatypeProperty"), None)
             if not existing:
                 graph.append(prop_entry)
+        else:
+            # Object property - links to another class
+            target_label = id_to_label.get(edge.get("target"), edge.get("target"))
+            if target_label:
+                prop_entry = {
+                    "@id": to_uri(predicate),
+                    "@type": "owl:ObjectProperty",
+                    "rdfs:domain": {"@id": to_uri(source_label)},
+                    "rdfs:range": {"@id": to_uri(target_label)},
+                    "_edgeId": edge.get("id")
+                }
+                # Avoid duplicate properties
+                existing = next((e for e in graph if e.get("@id") == to_uri(predicate) and e.get("@type") == "owl:ObjectProperty"), None)
+                if not existing:
+                    graph.append(prop_entry)
 
     return {
         "@context": {
@@ -666,31 +709,67 @@ def from_jsonld_ontology(jsonld: dict) -> dict:
     # Maps for reconstructing edges
     uri_to_node_id = {}
 
+    # Helper to check type (handles both prefixed and full URI forms)
+    def is_type(entry_type, type_name: str) -> bool:
+        if entry_type is None:
+            return False
+        type_uris = {
+            "owl:Class": ["owl:Class", "http://www.w3.org/2002/07/owl#Class"],
+            "owl:ObjectProperty": ["owl:ObjectProperty", "http://www.w3.org/2002/07/owl#ObjectProperty"],
+            "owl:DatatypeProperty": ["owl:DatatypeProperty", "http://www.w3.org/2002/07/owl#DatatypeProperty"],
+            "owl:Ontology": ["owl:Ontology", "http://www.w3.org/2002/07/owl#Ontology"],
+        }
+        valid_types = type_uris.get(type_name, [type_name])
+        if isinstance(entry_type, list):
+            return any(t in valid_types for t in entry_type)
+        return entry_type in valid_types
+
+    # Helper to get property value (handles expanded JSON-LD)
+    def get_prop(entry: dict, *keys) -> str | None:
+        for key in keys:
+            val = entry.get(key)
+            if val is not None:
+                if isinstance(val, list) and len(val) > 0:
+                    item = val[0]
+                    if isinstance(item, dict):
+                        return item.get("@value") or item.get("@id")
+                    return item
+                if isinstance(val, dict):
+                    return val.get("@value") or val.get("@id")
+                return val
+        return None
+
     # First pass: create nodes from classes
     for entry in graph:
         entry_type = entry.get("@type")
-        if entry_type == "owl:Class":
+        if is_type(entry_type, "owl:Class"):
             uri = entry.get("@id", "")
-            label = entry.get("rdfs:label", uri.replace("_", " "))
+            # Extract label from URI if not provided
+            label = get_prop(entry, "rdfs:label", "http://www.w3.org/2000/01/rdf-schema#label")
+            if not label:
+                # Extract label from URI (remove file:// prefix and path)
+                label = uri.split("/")[-1].replace("_", " ").replace("%20", " ")
+                if "%" in label:
+                    from urllib.parse import unquote
+                    label = unquote(label)
 
             # Use stored node ID or generate new one
             node_id = entry.get("_nodeId", str(node_id_counter))
             if not entry.get("_nodeId"):
                 node_id_counter += 1
 
-            position = entry.get("_position", {"x": 100, "y": node_id_counter * 100})
-
             nodes.append({
                 "id": node_id,
                 "type": "default",
-                "position": position,
                 "data": {"label": label}
             })
             uri_to_node_id[uri] = node_id
 
-            # Handle subClassOf
-            sub_class_of = entry.get("rdfs:subClassOf")
+            # Handle subClassOf (both prefixed and full URI)
+            sub_class_of = entry.get("rdfs:subClassOf") or entry.get("http://www.w3.org/2000/01/rdf-schema#subClassOf")
             if sub_class_of:
+                if isinstance(sub_class_of, list):
+                    sub_class_of = sub_class_of[0]
                 target_uri = sub_class_of.get("@id") if isinstance(sub_class_of, dict) else sub_class_of
                 edges.append({
                     "_source_uri": uri,
@@ -701,11 +780,18 @@ def from_jsonld_ontology(jsonld: dict) -> dict:
     # Second pass: create edges from object properties
     for entry in graph:
         entry_type = entry.get("@type")
-        if entry_type == "owl:ObjectProperty":
-            predicate = entry.get("@id", "relatedTo").replace("_", " ")
-            domain = entry.get("rdfs:domain", {})
-            range_val = entry.get("rdfs:range", {})
+        if is_type(entry_type, "owl:ObjectProperty"):
+            predicate = entry.get("@id", "relatedTo")
+            # Extract predicate name from URI
+            predicate = predicate.split("/")[-1].replace("_", " ")
+            domain = entry.get("rdfs:domain") or entry.get("http://www.w3.org/2000/01/rdf-schema#domain") or {}
+            range_val = entry.get("rdfs:range") or entry.get("http://www.w3.org/2000/01/rdf-schema#range") or {}
 
+            # Handle list values from expanded JSON-LD
+            if isinstance(domain, list) and len(domain) > 0:
+                domain = domain[0]
+            if isinstance(range_val, list) and len(range_val) > 0:
+                range_val = range_val[0]
             source_uri = domain.get("@id") if isinstance(domain, dict) else domain
             target_uri = range_val.get("@id") if isinstance(range_val, dict) else range_val
 
@@ -720,21 +806,88 @@ def from_jsonld_ontology(jsonld: dict) -> dict:
                 "id": edge_id
             })
 
+    # Third pass: create edges from datatype properties
+    # Map XSD types back to simple datatype names
+    xsd_to_datatype = {
+        "xsd:string": "string",
+        "xsd:integer": "integer",
+        "xsd:int": "integer",
+        "xsd:float": "float",
+        "xsd:double": "double",
+        "xsd:boolean": "boolean",
+        "xsd:bool": "boolean",
+        "xsd:date": "date",
+        "xsd:dateTime": "datetime",
+        "xsd:time": "time",
+        "http://www.w3.org/2001/XMLSchema#string": "string",
+        "http://www.w3.org/2001/XMLSchema#integer": "integer",
+        "http://www.w3.org/2001/XMLSchema#float": "float",
+        "http://www.w3.org/2001/XMLSchema#double": "double",
+        "http://www.w3.org/2001/XMLSchema#boolean": "boolean",
+        "http://www.w3.org/2001/XMLSchema#date": "date",
+        "http://www.w3.org/2001/XMLSchema#dateTime": "datetime",
+        "http://www.w3.org/2001/XMLSchema#time": "time",
+    }
+
+    for entry in graph:
+        entry_type = entry.get("@type")
+        if is_type(entry_type, "owl:DatatypeProperty"):
+            predicate = entry.get("@id", "property")
+            # Extract predicate name from URI
+            predicate = predicate.split("/")[-1].replace("_", " ")
+            domain = entry.get("rdfs:domain") or entry.get("http://www.w3.org/2000/01/rdf-schema#domain") or {}
+            range_val = entry.get("rdfs:range") or entry.get("http://www.w3.org/2000/01/rdf-schema#range") or {}
+
+            # Handle list values from expanded JSON-LD
+            if isinstance(domain, list) and len(domain) > 0:
+                domain = domain[0]
+            if isinstance(range_val, list) and len(range_val) > 0:
+                range_val = range_val[0]
+            source_uri = domain.get("@id") if isinstance(domain, dict) else domain
+            range_type = range_val.get("@id") if isinstance(range_val, dict) else range_val
+
+            # Get the stored datatype or convert from XSD type
+            datatype = entry.get("_datatype") or xsd_to_datatype.get(range_type, range_type.split("#")[-1].split(":")[-1] if range_type else "string")
+
+            edge_id = entry.get("_edgeId", f"edge-{edge_id_counter}")
+            if not entry.get("_edgeId"):
+                edge_id_counter += 1
+
+            edges.append({
+                "_source_uri": source_uri,
+                "_is_datatype": True,
+                "datatype": datatype,
+                "label": predicate,
+                "id": edge_id
+            })
+
     # Resolve edge URIs to node IDs
     resolved_edges = []
     for edge in edges:
         source_uri = edge.get("_source_uri")
-        target_uri = edge.get("_target_uri")
         source_id = uri_to_node_id.get(source_uri)
-        target_id = uri_to_node_id.get(target_uri)
 
-        if source_id and target_id:
-            resolved_edges.append({
-                "id": edge.get("id", f"edge-{len(resolved_edges) + 1}"),
-                "source": source_id,
-                "target": target_id,
-                "label": edge.get("label", "relatedTo")
-            })
+        if edge.get("_is_datatype"):
+            # Datatype property - no target node
+            if source_id:
+                resolved_edges.append({
+                    "id": edge.get("id", f"edge-{len(resolved_edges) + 1}"),
+                    "source": source_id,
+                    "label": edge.get("label", "property"),
+                    "datatype": edge.get("datatype", "string")
+                })
+        else:
+            # Object property - needs target node
+            target_uri = edge.get("_target_uri")
+            target_id = uri_to_node_id.get(target_uri)
+
+            if source_id and target_id:
+                resolved_edges.append({
+                    "id": edge.get("id", f"edge-{len(resolved_edges) + 1}"),
+                    "source": source_id,
+                    "target": target_id,
+                    "label": edge.get("label", "relatedTo")
+                })
 
     return {"nodes": nodes, "edges": resolved_edges}
 
@@ -851,6 +1004,10 @@ def from_jsonld_kg(jsonld: dict) -> dict:
 
 def load_knowledge_graphs(username: str, ontology_id: str) -> list[dict]:
     """Load list of knowledge graphs for a user's ontology."""
+    if use_graphdb():
+        return gdb.list_knowledge_graphs(username, ontology_id)
+
+    # Fallback to file storage
     index_file = get_kg_index_file(username, ontology_id)
     if not index_file.exists():
         return []
@@ -859,7 +1016,12 @@ def load_knowledge_graphs(username: str, ontology_id: str) -> list[dict]:
 
 
 def save_knowledge_graphs_index(username: str, ontology_id: str, kgs: list[dict]) -> None:
-    """Save list of knowledge graphs for a user's ontology."""
+    """Save list of knowledge graphs for a user's ontology (file-based fallback only)."""
+    if use_graphdb():
+        # GraphDB metadata is updated via gdb functions directly
+        return
+
+    # Fallback to file storage
     index_file = get_kg_index_file(username, ontology_id)
     with open(index_file, "w") as f:
         json.dump(kgs, f, indent=2)
@@ -867,6 +1029,10 @@ def save_knowledge_graphs_index(username: str, ontology_id: str, kgs: list[dict]
 
 def load_user_ontologies(username: str) -> list[dict]:
     """Load list of ontologies for a user."""
+    if use_graphdb():
+        return gdb.list_user_ontologies(username)
+
+    # Fallback to file storage
     index_file = get_user_ontologies_file(username)
     if not index_file.exists():
         return []
@@ -875,7 +1041,12 @@ def load_user_ontologies(username: str) -> list[dict]:
 
 
 def save_user_ontologies(username: str, ontologies: list[dict]) -> None:
-    """Save list of ontologies for a user."""
+    """Save list of ontologies for a user (file-based fallback only)."""
+    if use_graphdb():
+        # GraphDB metadata is updated via gdb functions directly
+        return
+
+    # Fallback to file storage
     index_file = get_user_ontologies_file(username)
     with open(index_file, "w") as f:
         json.dump(ontologies, f, indent=2)
@@ -883,39 +1054,22 @@ def save_user_ontologies(username: str, ontologies: list[dict]) -> None:
 
 def get_default_sandwich_ontology_graph() -> dict:
     """Generate the default sandwich ontology graph based on JSON-LD schema."""
-    # Node style
-    class_style = {"background": "#6366f1", "color": "white", "border": "none"}
-    parent_style = {"background": "#94a3b8", "color": "white", "border": "none"}
-
     nodes = [
-        # Parent classes (schema.org)
-        {"id": "1", "type": "default", "position": {"x": 400, "y": 0}, "data": {"label": "MenuItem"}, "style": parent_style},
-        {"id": "2", "type": "default", "position": {"x": 100, "y": 0}, "data": {"label": "Food"}, "style": parent_style},
-        {"id": "3", "type": "default", "position": {"x": 250, "y": 0}, "data": {"label": "Seasoning"}, "style": parent_style},
-        {"id": "4", "type": "default", "position": {"x": 550, "y": 0}, "data": {"label": "HowToStep"}, "style": parent_style},
-
-        # Main ontology classes
-        {"id": "5", "type": "default", "position": {"x": 300, "y": 150}, "data": {"label": "Sandwich"}, "style": class_style},
-        {"id": "6", "type": "default", "position": {"x": 50, "y": 150}, "data": {"label": "Bread"}, "style": class_style},
-        {"id": "7", "type": "default", "position": {"x": 150, "y": 250}, "data": {"label": "Filling"}, "style": class_style},
-        {"id": "8", "type": "default", "position": {"x": 250, "y": 350}, "data": {"label": "Condiment"}, "style": class_style},
-        {"id": "9", "type": "default", "position": {"x": 500, "y": 150}, "data": {"label": "PreparationStep"}, "style": class_style},
+        {"id": "1", "type": "default", "data": {"label": "Sandwich"}},
+        {"id": "2", "type": "default", "data": {"label": "Bread"}},
     ]
 
     edges = [
-        # subClassOf relationships
-        {"id": "e1", "source": "5", "target": "1", "label": "subClassOf"},
-        {"id": "e2", "source": "6", "target": "2", "label": "subClassOf"},
-        {"id": "e3", "source": "7", "target": "2", "label": "subClassOf"},
-        {"id": "e4", "source": "8", "target": "3", "label": "subClassOf"},
-        {"id": "e5", "source": "9", "target": "4", "label": "subClassOf"},
-
-        # Object property relationships
-        {"id": "e6", "source": "5", "target": "6", "label": "usesBread"},
-        {"id": "e7", "source": "5", "target": "7", "label": "hasFilling"},
-        {"id": "e8", "source": "5", "target": "8", "label": "includesCondiment"},
-        {"id": "e9", "source": "5", "target": "9", "label": "hasPreparationStep"},
-        {"id": "e10", "source": "5", "target": "1", "label": "pairedWith"},
+        # Bread is a subclass of Sandwich
+        {"id": "e1", "source": "2", "target": "1", "label": "subClassOf"},
+        # Sandwich properties
+        {"id": "e2", "source": "1", "target": "2", "label": "includesBread"},  # ObjectProperty -> Bread
+        {"id": "e3", "source": "1", "label": "includesCondiment", "datatype": "string"},
+        {"id": "e4", "source": "1", "label": "hasCheese", "datatype": "string"},
+        {"id": "e5", "source": "1", "label": "hasMeat", "datatype": "string"},
+        # Bread properties
+        {"id": "e6", "source": "2", "label": "numberOfPieces", "datatype": "integer"},
+        {"id": "e7", "source": "2", "label": "isGrainType", "datatype": "string"},
     ]
 
     return {"nodes": nodes, "edges": edges}
@@ -929,7 +1083,7 @@ def create_default_ontology_for_user(username: str) -> dict:
     # Create ontology metadata
     meta = {
         "id": ontology_id,
-        "name": "Sandwich Ontology (Example)",
+        "name": "Sandwich",
         "owner": username,
         "created_at": now,
         "updated_at": now,
@@ -955,9 +1109,8 @@ async def list_ontologies(username: str, _: Annotated[bool, Depends(verify_api_k
     """List all ontologies for a user."""
     ontologies = load_user_ontologies(username)
 
-    # Create default example ontology if user doesn't have it yet
-    has_example = any("(Example)" in o.get("name", "") for o in ontologies)
-    if not has_example:
+    # Create default example ontology if user has no ontologies
+    if len(ontologies) == 0:
         create_default_ontology_for_user(username)
         ontologies = load_user_ontologies(username)
 
@@ -979,18 +1132,22 @@ async def create_ontology(username: str, data: OntologyCreate, _: Annotated[bool
         "updated_at": now,
     }
 
-    # Save empty graph
-    ontology_file = get_ontology_file(ontology_id)
-    if not validate_file_path(ontology_file):
-        raise HTTPException(status_code=500, detail="Invalid file path")
+    if use_graphdb():
+        # Create named graph in GraphDB
+        gdb.create_named_graph(username, ontology_id, data.name)
+    else:
+        # Fallback: Save empty graph to file
+        ontology_file = get_ontology_file(ontology_id)
+        if not validate_file_path(ontology_file):
+            raise HTTPException(status_code=500, detail="Invalid file path")
 
-    with open(ontology_file, "w") as f:
-        json.dump({"nodes": [], "edges": []}, f, indent=2)
+        with open(ontology_file, "w") as f:
+            json.dump({"nodes": [], "edges": []}, f, indent=2)
 
-    # Add to user's index
-    ontologies = load_user_ontologies(username)
-    ontologies.append(meta)
-    save_user_ontologies(username, ontologies)
+        # Add to user's index
+        ontologies = load_user_ontologies(username)
+        ontologies.append(meta)
+        save_user_ontologies(username, ontologies)
 
     return {"status": "created", "ontology": meta}
 
@@ -1026,10 +1183,6 @@ def convert_jsonld_to_graph(jsonld: dict) -> dict:
     class_style = {"background": "#6366f1", "color": "white", "border": "none"}
     parent_style = {"background": "#94a3b8", "color": "white", "border": "none"}
 
-    # Layout configuration
-    x_spacing = 180
-    y_spacing = 120
-
     # Extract entities (classes)
     entities = jsonld.get("aiia:entities", [])
     if not entities and "@graph" in jsonld:
@@ -1048,23 +1201,19 @@ def convert_jsonld_to_graph(jsonld: dict) -> dict:
             if not sub_class_of.startswith("aiia:"):
                 parent_classes.add(sub_class_of)
 
-    # Create nodes for parent classes (top row)
-    x_pos = 50
+    # Create nodes for parent classes
     for parent in sorted(parent_classes):
         node_id = str(node_id_counter)
         entity_to_node_id[parent] = node_id
         nodes.append({
             "id": node_id,
             "type": "default",
-            "position": {"x": x_pos, "y": 0},
             "data": {"label": parent},
             "style": parent_style
         })
         node_id_counter += 1
-        x_pos += x_spacing
 
-    # Create nodes for main entities (second row)
-    x_pos = 50
+    # Create nodes for main entities
     for entity in entities:
         entity_id = entity.get("@id", "")
         label = entity.get("rdfs:label", entity_id.replace("aiia:", ""))
@@ -1074,12 +1223,10 @@ def convert_jsonld_to_graph(jsonld: dict) -> dict:
         nodes.append({
             "id": node_id,
             "type": "default",
-            "position": {"x": x_pos, "y": y_spacing},
             "data": {"label": label},
             "style": class_style
         })
         node_id_counter += 1
-        x_pos += x_spacing
 
     # Create edges for subClassOf relationships
     edge_id_counter = 1
@@ -1170,7 +1317,22 @@ async def import_ontology(username: str, data: OntologyImport, _: Annotated[bool
 @app.get("/ontologies/{username}/{ontology_id}")
 async def load_ontology(username: str, ontology_id: str, _: Annotated[bool, Depends(verify_api_key)]):
     """Load an ontology."""
-    # Verify ownership
+    if use_graphdb():
+        # Get metadata from GraphDB
+        meta = gdb.get_ontology_metadata(username, ontology_id)
+        if not meta:
+            raise HTTPException(status_code=404, detail="Ontology not found")
+
+        # Get graph data as JSON-LD
+        jsonld_data = gdb.get_ontology_as_jsonld(username, ontology_id)
+        if jsonld_data:
+            graph = from_jsonld_ontology(jsonld_data)
+        else:
+            graph = {"nodes": [], "edges": []}
+
+        return {"meta": meta, "graph": graph}
+
+    # Fallback: File-based storage
     ontologies = load_user_ontologies(username)
     meta = next((o for o in ontologies if o["id"] == ontology_id), None)
     if not meta:
@@ -1200,7 +1362,24 @@ async def load_ontology(username: str, ontology_id: str, _: Annotated[bool, Depe
 @app.put("/ontologies/{username}/{ontology_id}")
 async def save_ontology(username: str, ontology_id: str, data: OntologySave, _: Annotated[bool, Depends(verify_api_key)]):
     """Save an ontology."""
-    # Verify ownership
+    # Convert to JSON-LD format
+    internal_format = data.graph.model_dump()
+    jsonld_format = to_jsonld_ontology(internal_format, data.name)
+
+    if use_graphdb():
+        # Verify ontology exists
+        meta = gdb.get_ontology_metadata(username, ontology_id)
+        if not meta:
+            raise HTTPException(status_code=404, detail="Ontology not found")
+
+        # Update in GraphDB
+        gdb.update_ontology(username, ontology_id, jsonld_format, data.name)
+
+        # Get updated metadata
+        meta = gdb.get_ontology_metadata(username, ontology_id)
+        return {"status": "saved", "ontology": meta}
+
+    # Fallback: File-based storage
     ontologies = load_user_ontologies(username)
     meta_idx = next((i for i, o in enumerate(ontologies) if o["id"] == ontology_id), None)
     if meta_idx is None:
@@ -1209,10 +1388,6 @@ async def save_ontology(username: str, ontology_id: str, data: OntologySave, _: 
     ontology_file = get_ontology_file(ontology_id)
     if not validate_file_path(ontology_file):
         raise HTTPException(status_code=500, detail="Invalid file path")
-
-    # Convert to JSON-LD format for storage
-    internal_format = data.graph.model_dump()
-    jsonld_format = to_jsonld_ontology(internal_format, data.name)
 
     # Save as JSON-LD
     with open(ontology_file, "w") as f:
@@ -1229,7 +1404,21 @@ async def save_ontology(username: str, ontology_id: str, data: OntologySave, _: 
 @app.delete("/ontologies/{username}/{ontology_id}")
 async def delete_ontology(username: str, ontology_id: str, _: Annotated[bool, Depends(verify_api_key)]):
     """Delete an ontology and all its knowledge graphs."""
-    # Verify ownership
+    if use_graphdb():
+        # Verify ownership
+        meta = gdb.get_ontology_metadata(username, ontology_id)
+        if not meta:
+            raise HTTPException(status_code=404, detail="Ontology not found")
+
+        # Delete all knowledge graphs
+        kgs_deleted = gdb.delete_all_knowledge_graphs(username, ontology_id)
+
+        # Delete the ontology
+        gdb.delete_named_graph(username, ontology_id)
+
+        return {"status": "deleted", "knowledge_graphs_deleted": kgs_deleted}
+
+    # Fallback: File-based storage
     ontologies = load_user_ontologies(username)
     meta_idx = next((i for i, o in enumerate(ontologies) if o["id"] == ontology_id), None)
     if meta_idx is None:
@@ -1241,7 +1430,7 @@ async def delete_ontology(username: str, ontology_id: str, _: Annotated[bool, De
         kg_file = get_kg_file(kg["id"])
         if validate_file_path(kg_file) and kg_file.exists():
             kg_file.unlink()
-    
+
     # Delete the knowledge graphs index file
     kg_index_file = get_kg_index_file(username, ontology_id)
     if kg_index_file.exists():
@@ -1291,10 +1480,10 @@ async def create_knowledge_graph(username: str, ontology_id: str, data: Knowledg
     # Verify ownership
     if not verify_ontology_ownership(username, ontology_id):
         raise HTTPException(status_code=404, detail="Ontology not found")
-    
+
     kg_id = secrets.token_hex(8)
     now = datetime.utcnow().isoformat()
-    
+
     # Create knowledge graph metadata
     meta = {
         "id": kg_id,
@@ -1304,20 +1493,24 @@ async def create_knowledge_graph(username: str, ontology_id: str, data: Knowledg
         "created_at": now,
         "updated_at": now,
     }
-    
-    # Save empty data
-    kg_file = get_kg_file(kg_id)
-    if not validate_file_path(kg_file):
-        raise HTTPException(status_code=500, detail="Invalid file path")
-    
-    with open(kg_file, "w") as f:
-        json.dump({}, f, indent=2)
-    
-    # Add to index
-    kgs = load_knowledge_graphs(username, ontology_id)
-    kgs.append(meta)
-    save_knowledge_graphs_index(username, ontology_id, kgs)
-    
+
+    if use_graphdb():
+        # Create in GraphDB
+        gdb.create_knowledge_graph(username, ontology_id, kg_id, data.name)
+    else:
+        # Fallback: Save empty data to file
+        kg_file = get_kg_file(kg_id)
+        if not validate_file_path(kg_file):
+            raise HTTPException(status_code=500, detail="Invalid file path")
+
+        with open(kg_file, "w") as f:
+            json.dump({}, f, indent=2)
+
+        # Add to index
+        kgs = load_knowledge_graphs(username, ontology_id)
+        kgs.append(meta)
+        save_knowledge_graphs_index(username, ontology_id, kgs)
+
     return {"status": "created", "knowledge_graph": meta}
 
 
@@ -1398,22 +1591,27 @@ async def delete_knowledge_graph(username: str, ontology_id: str, kg_id: str, _:
     # Verify ownership
     if not verify_ontology_ownership(username, ontology_id):
         raise HTTPException(status_code=404, detail="Ontology not found")
-    
-    # Verify knowledge graph exists and belongs to this ontology
+
+    if use_graphdb():
+        # Delete from GraphDB
+        gdb.delete_knowledge_graph(username, ontology_id, kg_id)
+        return {"status": "deleted"}
+
+    # Fallback: File-based storage
     kgs = load_knowledge_graphs(username, ontology_id)
     meta_idx = next((i for i, kg in enumerate(kgs) if kg["id"] == kg_id), None)
     if meta_idx is None:
         raise HTTPException(status_code=404, detail="Knowledge graph not found")
-    
+
     # Delete the data file
     kg_file = get_kg_file(kg_id)
     if validate_file_path(kg_file) and kg_file.exists():
         kg_file.unlink()
-    
+
     # Remove from index
     kgs.pop(meta_idx)
     save_knowledge_graphs_index(username, ontology_id, kgs)
-    
+
     return {"status": "deleted"}
 
 
@@ -1439,6 +1637,9 @@ class ChatMessageInput(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: list[ChatMessageInput]
+    ontology_id: str | None = None
+    username: str | None = None
+    debug_mode: bool = False
 
     @field_validator("messages")
     @classmethod
@@ -1448,12 +1649,181 @@ class ChatRequest(BaseModel):
         return v
 
 
+class AppliedAction(BaseModel):
+    action: str
+    details: dict
+
+
 class ChatResponse(BaseModel):
     content: str
+    updated_graph: dict | None = None
+    applied_actions: list[AppliedAction] | None = None
 
 
 # Initialize OpenAI client
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+
+def parse_actions_from_response(content: str) -> list[dict]:
+    """Parse JSON action blocks from LLM response."""
+    import re
+    actions = []
+
+    # Match ```json ... ``` blocks
+    json_block_pattern = r'```json\s*([\s\S]*?)```'
+    matches = re.findall(json_block_pattern, content, re.IGNORECASE)
+
+    for match in matches:
+        json_str = match.strip()
+        # Try parsing as single JSON
+        try:
+            parsed = json.loads(json_str)
+            if isinstance(parsed, dict) and "action" in parsed:
+                actions.append(parsed)
+            elif isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, dict) and "action" in item:
+                        actions.append(item)
+            continue
+        except json.JSONDecodeError:
+            pass
+
+        # Try line by line
+        for line in json_str.split('\n'):
+            line = line.strip()
+            if line.startswith('{'):
+                try:
+                    parsed = json.loads(line)
+                    if isinstance(parsed, dict) and "action" in parsed:
+                        actions.append(parsed)
+                except json.JSONDecodeError:
+                    pass
+
+    return actions
+
+
+def apply_actions_to_graph(nodes: list[dict], edges: list[dict], actions: list[dict]) -> tuple[list[dict], list[dict], list[AppliedAction]]:
+    """Apply parsed actions to the graph and return updated nodes/edges."""
+    import time
+    applied = []
+
+    for action in actions:
+        action_type = action.get("action")
+
+        if action_type == "add_node":
+            label = action.get("label")
+            if not label:
+                continue
+            # Check if node already exists
+            if any(n.get("data", {}).get("label") == label for n in nodes):
+                continue
+
+            new_node = {
+                "id": f"node-{int(time.time() * 1000)}",
+                "type": "default",
+                "data": {"label": label}
+            }
+            nodes.append(new_node)
+
+            # Add subClassOf edge if parent specified
+            parent = action.get("parent")
+            if parent:
+                parent_node = next((n for n in nodes if n.get("data", {}).get("label") == parent), None)
+                if parent_node:
+                    edges.append({
+                        "id": f"edge-{int(time.time() * 1000)}",
+                        "source": new_node["id"],
+                        "target": parent_node["id"],
+                        "label": "subClassOf"
+                    })
+
+            applied.append(AppliedAction(action="add_node", details={"label": label, "parent": parent}))
+
+        elif action_type == "remove_node":
+            label = action.get("label")
+            if not label:
+                continue
+            node_to_remove = next((n for n in nodes if n.get("data", {}).get("label") == label), None)
+            if node_to_remove:
+                node_id = node_to_remove["id"]
+                nodes = [n for n in nodes if n["id"] != node_id]
+                edges = [e for e in edges if e.get("source") != node_id and e.get("target") != node_id]
+                applied.append(AppliedAction(action="remove_node", details={"label": label}))
+
+        elif action_type == "add_property":
+            # Accept both "class" and "target" for the class name
+            class_name = action.get("class") or action.get("target")
+            property_name = action.get("property") or action.get("name")
+            if not class_name or not property_name:
+                continue
+
+            class_node = next((n for n in nodes if n.get("data", {}).get("label") == class_name), None)
+            if not class_node:
+                continue
+
+            # Find or create String node
+            string_node = next((n for n in nodes if n.get("data", {}).get("label") == "String"), None)
+            if not string_node:
+                string_node = {
+                    "id": f"node-string-{int(time.time() * 1000)}",
+                    "type": "default",
+                    "data": {"label": "String"}
+                }
+                nodes.append(string_node)
+
+            # Check if property already exists
+            if any(e.get("source") == class_node["id"] and e.get("label") == property_name for e in edges):
+                continue
+
+            edges.append({
+                "id": f"edge-{int(time.time() * 1000)}-{len(edges)}",
+                "source": class_node["id"],
+                "target": string_node["id"],
+                "label": property_name
+            })
+            applied.append(AppliedAction(action="add_property", details={"class": class_name, "property": property_name}))
+
+        elif action_type == "add_edge":
+            source = action.get("source")
+            target = action.get("target")
+            label = action.get("label", "relatedTo")
+            if not source or not target:
+                continue
+
+            source_node = next((n for n in nodes if n.get("data", {}).get("label") == source), None)
+            target_node = next((n for n in nodes if n.get("data", {}).get("label") == target), None)
+            if not source_node or not target_node:
+                continue
+
+            # Check if edge already exists
+            if any(e.get("source") == source_node["id"] and e.get("target") == target_node["id"] for e in edges):
+                continue
+
+            edges.append({
+                "id": f"edge-{int(time.time() * 1000)}-{len(edges)}",
+                "source": source_node["id"],
+                "target": target_node["id"],
+                "label": label
+            })
+            applied.append(AppliedAction(action="add_edge", details={"source": source, "target": target, "label": label}))
+
+        elif action_type == "remove_edge":
+            source = action.get("source")
+            target = action.get("target")
+            if not source or not target:
+                continue
+
+            source_node = next((n for n in nodes if n.get("data", {}).get("label") == source), None)
+            target_node = next((n for n in nodes if n.get("data", {}).get("label") == target), None)
+            if not source_node or not target_node:
+                continue
+
+            original_len = len(edges)
+            edges = [e for e in edges if not (e.get("source") == source_node["id"] and e.get("target") == target_node["id"])]
+            if len(edges) < original_len:
+                applied.append(AppliedAction(action="remove_edge", details={"source": source, "target": target}))
+
+    return nodes, edges, applied
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -1466,15 +1836,110 @@ async def chat(request: ChatRequest, _: Annotated[bool, Depends(verify_api_key)]
         )
 
     try:
+        # Prepare messages - inject debug mode instructions if enabled
+        messages = [{"role": m.role, "content": m.content} for m in request.messages]
+
+        if request.debug_mode:
+            # Prepend debug mode instruction to the system message
+            debug_instruction = """[DEBUG MODE ENABLED]
+You are in debug/preview mode. DO NOT output any JSON action blocks.
+Instead, analyze the user's request and respond with a hypothetical plan describing:
+1. What actions you WOULD take if this were a real request
+2. What nodes/edges WOULD be added, removed, or modified
+3. Any potential issues or considerations
+
+Format your response as a clear explanation, NOT as executable JSON actions.
+Start your response with "[DEBUG PREVIEW]" to indicate this is a preview only.
+
+"""
+            if messages and messages[0]["role"] == "system":
+                messages[0]["content"] = debug_instruction + messages[0]["content"]
+            else:
+                messages.insert(0, {"role": "system", "content": debug_instruction})
+
         client = OpenAI(api_key=OPENAI_API_KEY)
         response = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": m.role, "content": m.content} for m in request.messages],
+            messages=messages,
             temperature=0.7,
             max_tokens=1000,
         )
         content = response.choices[0].message.content or ""
-        return ChatResponse(content=content)
+
+        # If ontology_id and username provided, parse and apply actions (skip in debug mode)
+        updated_graph = None
+        applied_actions = None
+
+        if request.ontology_id and request.username and not request.debug_mode:
+            graph_data = None
+            ontology_name = "Ontology"
+
+            if use_graphdb():
+                # Load from GraphDB
+                meta = gdb.get_ontology_metadata(request.username, request.ontology_id)
+                if meta:
+                    ontology_name = meta.get("name", "Ontology")
+                    jsonld_data = gdb.get_ontology_as_jsonld(request.username, request.ontology_id)
+                    if jsonld_data:
+                        graph_data = from_jsonld_ontology(jsonld_data)
+                    else:
+                        graph_data = {"nodes": [], "edges": []}
+            else:
+                # Fallback: Load from file
+                ontology_file = get_ontology_file(request.ontology_id)
+                if validate_file_path(ontology_file) and ontology_file.exists():
+                    with open(ontology_file) as f:
+                        stored_data = json.load(f)
+
+                    # Check if stored as JSON-LD or legacy format
+                    if "@context" in stored_data and "@graph" in stored_data:
+                        graph_data = from_jsonld_ontology(stored_data)
+                    else:
+                        graph_data = stored_data
+
+                    # Get ontology name
+                    ontologies = load_user_ontologies(request.username)
+                    for ont in ontologies:
+                        if ont.get("id") == request.ontology_id:
+                            ontology_name = ont.get("name", "Ontology")
+                            break
+
+            if graph_data:
+                nodes = graph_data.get("nodes", [])
+                edges = graph_data.get("edges", [])
+
+                # Parse actions from response
+                actions = parse_actions_from_response(content)
+
+                if actions:
+                    # Apply actions
+                    nodes, edges, applied_actions = apply_actions_to_graph(nodes, edges, actions)
+
+                    # Save updated graph
+                    updated_graph = {"nodes": nodes, "edges": edges}
+                    jsonld_format = to_jsonld_ontology(updated_graph, ontology_name)
+
+                    if use_graphdb():
+                        # Save to GraphDB
+                        gdb.update_ontology(request.username, request.ontology_id, jsonld_format, ontology_name)
+                    else:
+                        # Fallback: Save to file
+                        ontologies = load_user_ontologies(request.username)
+                        for ont in ontologies:
+                            if ont.get("id") == request.ontology_id:
+                                ont["updated_at"] = datetime.utcnow().isoformat()
+                                break
+                        save_user_ontologies(request.username, ontologies)
+
+                        ontology_file = get_ontology_file(request.ontology_id)
+                        with open(ontology_file, "w") as f:
+                            json.dump(jsonld_format, f, indent=2)
+
+        return ChatResponse(
+            content=content,
+            updated_graph=updated_graph,
+            applied_actions=applied_actions
+        )
     except Exception as e:
         # Log error but don't expose details
         print(f"OpenAI API error: {e}")

@@ -15,7 +15,7 @@ interface NodeGroup {
   nodeId: string;
   label: string;
   depth: number;
-  properties: { predicate: string; object: string; depth: number; childNodeId?: string }[];
+  properties: { predicate: string; object: string; depth: number; childNodeId?: string; isDatatype?: boolean; isObjectProperty?: boolean }[];
 }
 
 function buildHierarchy(nodes: Node[], edges: Edge[]): NodeGroup[] {
@@ -44,21 +44,46 @@ function buildHierarchy(nodes: Node[], edges: Edge[]): NodeGroup[] {
   const result: NodeGroup[] = [];
   const visited = new Set<string>();
 
-  function collectProperties(nodeId: string, depth: number): { predicate: string; object: string; depth: number; childNodeId?: string }[] {
-    const properties: { predicate: string; object: string; depth: number; childNodeId?: string }[] = [];
+  // Track visited nodes for object properties to avoid infinite recursion
+  const visitedForProps = new Set<string>();
+
+  function collectProperties(nodeId: string, depth: number): { predicate: string; object: string; depth: number; childNodeId?: string; isDatatype?: boolean; isObjectProperty?: boolean }[] {
+    const properties: { predicate: string; object: string; depth: number; childNodeId?: string; isDatatype?: boolean; isObjectProperty?: boolean }[] = [];
 
     // Add non-subClassOf edges where this node is the source
     edges.forEach((edge) => {
       if (edge.source === nodeId) {
         const predicate = typeof edge.label === 'string' ? edge.label : 'relatedTo';
         if (predicate === 'subClassOf') return; // Handle subClassOf separately
-        const targetNode = nodes.find((n) => n.id === edge.target);
-        if (targetNode) {
+
+        // Check if this is a datatype property (has datatype field, no target)
+        if (edge.datatype) {
           properties.push({
             predicate,
-            object: targetNode.data.label || targetNode.id,
+            object: edge.datatype,
             depth,
+            isDatatype: true,
           });
+        } else if (edge.target) {
+          // Object property - links to another class
+          const targetNode = nodes.find((n) => n.id === edge.target);
+          if (targetNode) {
+            const targetLabel = targetNode.data.label || targetNode.id;
+            properties.push({
+              predicate,
+              object: targetLabel,
+              depth,
+              childNodeId: edge.target,
+              isObjectProperty: true,
+            });
+
+            // Recursively add target class's properties (if not already visited)
+            if (!visitedForProps.has(edge.target)) {
+              visitedForProps.add(edge.target);
+              const targetProps = collectProperties(edge.target, depth + 1);
+              properties.push(...targetProps);
+            }
+          }
         }
       }
     });
@@ -118,9 +143,38 @@ function buildHierarchy(nodes: Node[], edges: Edge[]): NodeGroup[] {
 export default function TriplesView({ nodes, edges, selectedKnowledgeGraphId, ontologyId, username, onKnowledgeGraphUpdate }: TriplesViewProps) {
   const hierarchy = buildHierarchy(nodes, edges);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [selectedProperty, setSelectedProperty] = useState<{ predicate: string; object: string; isDatatype?: boolean; isObjectProperty?: boolean } | null>(null);
   const [kgData, setKgData] = useState<Record<string, string[]>>({});
   const [inputValues, setInputValues] = useState<Record<string, string>>({});
   const [relationshipValues, setRelationshipValues] = useState<Record<string, string>>({});
+
+  // Build ASCII hierarchy for a given class name (supports multiple parents)
+  const getClassHierarchy = (className: string): string[] | null => {
+    const node = nodes.find(n => (n.data.label || n.id) === className);
+    if (!node) return null;
+
+    // Find all direct parents
+    const subClassEdges = edges.filter(e => e.source === node.id && e.label === 'subClassOf');
+    if (subClassEdges.length === 0) return null;
+
+    const parents = subClassEdges
+      .map(e => nodes.find(n => n.id === e.target))
+      .filter(Boolean)
+      .map(n => n!.data.label || n!.id);
+
+    if (parents.length === 0) return null;
+
+    // Build ASCII tree with compact inline format for multiple parents
+    const lines: string[] = [];
+    if (parents.length === 1) {
+      lines.push(parents[0]);
+    } else {
+      lines.push('[' + parents.join(', ') + ']');
+    }
+    lines.push('└── ' + className);
+
+    return lines;
+  };
 
   // Expose save function via window for the save button
   useEffect(() => {
@@ -353,10 +407,48 @@ export default function TriplesView({ nodes, edges, selectedKnowledgeGraphId, on
     }
   };
 
-  const rows: { subject: string; predicate: string; object: string; depth: number; isFirst: boolean; nodeId?: string; childNodeId?: string }[] = [];
+  const rows: { subject: string; predicate: string; object: string; depth: number; isFirst: boolean; nodeId?: string; childNodeId?: string; isDatatype?: boolean; isObjectProperty?: boolean; isSubclassHeader?: boolean; isSubclass?: boolean }[] = [];
 
+  // Build subclass relationships map
+  const subclasses = new Map<string, { id: string; label: string }[]>();
+  edges.forEach((edge) => {
+    if (edge.label === 'subClassOf' && edge.target) {
+      const parentNode = nodes.find(n => n.id === edge.target);
+      const childNode = nodes.find(n => n.id === edge.source);
+      if (parentNode && childNode) {
+        const parentLabel = parentNode.data.label || parentNode.id;
+        if (!subclasses.has(parentLabel)) {
+          subclasses.set(parentLabel, []);
+        }
+        subclasses.get(parentLabel)!.push({
+          id: childNode.id,
+          label: childNode.data.label || childNode.id
+        });
+      }
+    }
+  });
+
+  // Helper to get properties for a node (non-subClassOf, non-object properties at depth 0)
+  const getNodeProperties = (nodeId: string) => {
+    return edges.filter(e =>
+      e.source === nodeId &&
+      e.label !== 'subClassOf'
+    ).map(e => ({
+      predicate: e.label || 'relatedTo',
+      object: e.datatype || (e.target ? (nodes.find(n => n.id === e.target)?.data.label || e.target) : ''),
+      isDatatype: !!e.datatype,
+      isObjectProperty: !e.datatype && !!e.target,
+      targetId: e.target,
+    }));
+  };
+
+  // Show root classes (those that aren't subclasses of anything)
   hierarchy.forEach((group) => {
-    // Add the subject row (only for root nodes)
+    const hasProperties = group.properties.some(p => p.predicate !== 'subClassOf');
+    const hasSubclasses = subclasses.has(group.label);
+    if (!hasProperties && !hasSubclasses) return;
+
+    // Add the subject row (primary class)
     rows.push({
       subject: group.label,
       predicate: '',
@@ -365,17 +457,63 @@ export default function TriplesView({ nodes, edges, selectedKnowledgeGraphId, on
       isFirst: true,
       nodeId: group.nodeId,
     });
-    // Add property rows with their own depth
-    group.properties.forEach((prop) => {
+
+    // Add property rows (only direct properties, not nested)
+    const directProps = getNodeProperties(group.nodeId);
+    directProps.forEach((prop) => {
       rows.push({
         subject: group.label,
         predicate: prop.predicate,
         object: prop.object,
-        depth: prop.depth,
+        depth: 0,
         isFirst: false,
-        childNodeId: prop.childNodeId,
+        isDatatype: prop.isDatatype,
+        isObjectProperty: prop.isObjectProperty,
+        childNodeId: prop.targetId,
       });
     });
+
+    // Add Subclasses section if this class has subclasses
+    const classSubclasses = subclasses.get(group.label);
+    if (classSubclasses && classSubclasses.length > 0) {
+      // Add "Subclasses" header row
+      rows.push({
+        subject: group.label,
+        predicate: 'Subclasses',
+        object: '',
+        depth: 0,
+        isFirst: false,
+        isSubclassHeader: true,
+      });
+
+      // Add each subclass and its properties
+      classSubclasses.forEach((sub) => {
+        rows.push({
+          subject: sub.label,
+          predicate: '',
+          object: '',
+          depth: 1,
+          isFirst: false,
+          nodeId: sub.id,
+          isSubclass: true,
+        });
+
+        // Add subclass properties
+        const subProps = getNodeProperties(sub.id);
+        subProps.forEach((prop) => {
+          rows.push({
+            subject: sub.label,
+            predicate: prop.predicate,
+            object: prop.object,
+            depth: 1,
+            isFirst: false,
+            isDatatype: prop.isDatatype,
+            isObjectProperty: prop.isObjectProperty,
+            childNodeId: prop.targetId,
+          });
+        });
+      });
+    }
   });
 
   const selectedNode = selectedNodeId ? nodes.find(n => n.id === selectedNodeId) : null;
@@ -393,14 +531,17 @@ export default function TriplesView({ nodes, edges, selectedKnowledgeGraphId, on
         </thead>
         <tbody>
           {rows.map((row, index) => (
-            <tr key={index} style={{ backgroundColor: row.isFirst ? '#ffffff' : '#fafafa' }}>
+            <tr key={index} style={{
+              backgroundColor: row.isFirst ? '#ffffff' : (row.isSubclassHeader ? '#e2e8f0' : (row.isSubclass ? '#f1f5f9' : (row.depth > 0 ? '#f8fafc' : '#fafafa')))
+            }}>
               <td
                 style={{
                   padding: '10px 12px',
-                  paddingLeft: `${12 + row.depth * 24}px`,
+                  paddingLeft: row.isFirst ? '12px' : (row.isSubclassHeader ? '24px' : (row.isSubclass ? '36px' : `calc(12px + ${(row.depth + 1) * 2}ch)`)),
                   borderBottom: '1px solid #e2e8f0',
-                  color: '#6366f1',
-                  fontWeight: row.isFirst ? 600 : 400,
+                  color: row.isSubclassHeader ? '#64748b' : '#6366f1',
+                  fontWeight: row.isFirst || row.isSubclassHeader || row.isSubclass ? 600 : 400,
+                  fontStyle: row.isSubclassHeader ? 'italic' : 'normal',
                 }}
               >
                 {row.isFirst ? (
@@ -431,12 +572,76 @@ export default function TriplesView({ nodes, edges, selectedKnowledgeGraphId, on
                       title="View node information"
                     />
                   </div>
+                ) : row.isSubclassHeader ? (
+                  <span>{row.predicate}</span>
+                ) : row.isSubclass ? (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <span>{row.subject}</span>
+                    <button
+                      onClick={() => setSelectedNodeId(row.nodeId || null)}
+                      style={{
+                        background: `url('/info-sign-icon-set-about-us-icon-faq-icon-vector.jpg') no-repeat`,
+                        backgroundPosition: '100% 0%',
+                        backgroundSize: '200% 200%',
+                        border: 'none',
+                        cursor: 'pointer',
+                        padding: 0,
+                        display: 'inline-block',
+                        width: '18px',
+                        height: '18px',
+                        borderRadius: '4px',
+                        transition: 'opacity 0.2s',
+                        opacity: 0.7,
+                      }}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.style.opacity = '1';
+                      }}
+                      onMouseLeave={(e) => {
+                        e.currentTarget.style.opacity = '0.7';
+                      }}
+                      title="View node information"
+                    />
+                  </div>
                 ) : (
-                  <span>
-                    <span style={{ color: '#059669' }}>{row.predicate}</span>
-                    {' '}
-                    <span style={{ color: '#6366f1' }}>{row.object}</span>
-                  </span>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <span>
+                      <span style={{ color: '#059669' }}>{row.predicate}</span>
+                      {' → '}
+                      <span style={{
+                        color: row.isDatatype ? '#d97706' : '#6366f1',
+                        fontStyle: row.isDatatype ? 'italic' : 'normal',
+                      }}>
+                        {row.object}
+                      </span>
+                      {row.isDatatype && (
+                        <span style={{ color: '#94a3b8', fontSize: '11px', marginLeft: '4px' }}>(datatype)</span>
+                      )}
+                    </span>
+                    <button
+                      onClick={() => setSelectedProperty({ predicate: row.predicate, object: row.object, isDatatype: row.isDatatype, isObjectProperty: row.isObjectProperty })}
+                      style={{
+                        background: `url('/info-sign-icon-set-about-us-icon-faq-icon-vector.jpg') no-repeat`,
+                        backgroundPosition: '100% 0%',
+                        backgroundSize: '200% 200%',
+                        border: 'none',
+                        cursor: 'pointer',
+                        padding: 0,
+                        display: 'inline-block',
+                        width: '18px',
+                        height: '18px',
+                        borderRadius: '4px',
+                        transition: 'opacity 0.2s',
+                        opacity: 0.7,
+                      }}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.style.opacity = '1';
+                      }}
+                      onMouseLeave={(e) => {
+                        e.currentTarget.style.opacity = '0.7';
+                      }}
+                      title="View property information"
+                    />
+                  </div>
                 )}
               </td>
               {selectedKnowledgeGraphId && (
@@ -446,7 +651,7 @@ export default function TriplesView({ nodes, edges, selectedKnowledgeGraphId, on
                     borderBottom: '1px solid #e2e8f0',
                   }}
                 >
-                  {row.isFirst ? (
+                  {row.isFirst || row.isSubclass ? (
                     <input
                       type="text"
                       value={inputValues[row.subject] || ''}
@@ -462,29 +667,9 @@ export default function TriplesView({ nodes, edges, selectedKnowledgeGraphId, on
                         fontFamily: 'inherit',
                       }}
                     />
+                  ) : row.isSubclassHeader ? (
+                    <span style={{ color: '#94a3b8', fontSize: '12px' }}>—</span>
                   ) : (() => {
-                    // For subClassOf rows, show instance input for that child class
-                    if (row.predicate === 'subClassOf' && row.childNodeId) {
-                      const childClass = row.object;
-                      return (
-                        <input
-                          type="text"
-                          value={inputValues[childClass] || ''}
-                          onChange={(e) => handleValueChange(childClass, e.target.value)}
-                          onBlur={() => handleValueBlur(childClass)}
-                          placeholder="Enter instances (comma-separated)..."
-                          style={{
-                            width: '100%',
-                            padding: '6px 8px',
-                            border: '1px solid #cbd5e1',
-                            borderRadius: '4px',
-                            fontSize: '13px',
-                            fontFamily: 'inherit',
-                          }}
-                        />
-                      );
-                    }
-
                     // For other property rows, check if the object is a class with instances
                     const targetClass = row.object;
                     const relationshipKey = `${row.subject}:${row.predicate}:${targetClass}`;
@@ -503,7 +688,7 @@ export default function TriplesView({ nodes, edges, selectedKnowledgeGraphId, on
                         .split(',')
                         .map((v) => v.trim())
                         .filter((v) => v.length > 0);
-                      
+
                       // Filter out already selected instances
                       const selectableInstances = availableInstances.filter(
                         (instance) => !currentSelected.includes(instance)
@@ -565,33 +750,6 @@ export default function TriplesView({ nodes, edges, selectedKnowledgeGraphId, on
               )}
             </tr>
           ))}
-          {/* Classes row */}
-          <tr style={{ backgroundColor: '#f8fafc' }}>
-            <td
-              colSpan={selectedKnowledgeGraphId ? 2 : 1}
-              style={{
-                padding: '12px',
-                borderTop: '2px solid #e2e8f0',
-                borderBottom: '1px solid #e2e8f0',
-              }}
-            >
-              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
-                <span style={{ fontWeight: 600, color: '#475569' }}>Classes:</span>
-                {nodes.map((node, idx) => (
-                  <span
-                    key={node.id}
-                    style={{
-                      color: '#6366f1',
-                      fontWeight: 500,
-                    }}
-                  >
-                    {node.data.label || node.id}
-                    {idx < nodes.length - 1 && <span style={{ color: '#94a3b8', marginLeft: '8px' }}>,</span>}
-                  </span>
-                ))}
-              </div>
-            </td>
-          </tr>
         </tbody>
       </table>
       {rows.length === 0 && (
@@ -685,14 +843,107 @@ export default function TriplesView({ nodes, edges, selectedKnowledgeGraphId, on
                   {selectedNode.type || 'default'}
                 </div>
               </div>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* Property Info Popup */}
+      {selectedProperty && (
+        <>
+          {/* Overlay */}
+          <div
+            style={{
+              position: 'fixed',
+              top: 0,
+              left: 0,
+              right: 0,
+              bottom: 0,
+              backgroundColor: 'rgba(0, 0, 0, 0.5)',
+              zIndex: 1000,
+              cursor: 'pointer',
+            }}
+            onClick={() => setSelectedProperty(null)}
+          />
+          {/* Popup */}
+          <div
+            style={{
+              position: 'fixed',
+              top: '50%',
+              left: '50%',
+              transform: 'translate(-50%, -50%)',
+              backgroundColor: '#ffffff',
+              borderRadius: '8px',
+              padding: '24px',
+              boxShadow: '0 10px 25px rgba(0, 0, 0, 0.2)',
+              zIndex: 1001,
+              minWidth: '300px',
+              maxWidth: '500px',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+              <h3 style={{ margin: 0, fontSize: '18px', fontWeight: 600, color: '#1e293b' }}>
+                Property Information
+              </h3>
+              <button
+                onClick={() => setSelectedProperty(null)}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  fontSize: '20px',
+                  cursor: 'pointer',
+                  color: '#64748b',
+                  padding: '0',
+                  width: '24px',
+                  height: '24px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}
+              >
+                ×
+              </button>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
               <div>
                 <div style={{ fontSize: '12px', color: '#64748b', marginBottom: '4px', fontWeight: 500 }}>
-                  Position
+                  Property Name
                 </div>
-                <div style={{ fontSize: '14px', color: '#1e293b', fontFamily: 'monospace' }}>
-                  ({selectedNode.position.x.toFixed(0)}, {selectedNode.position.y.toFixed(0)})
+                <div style={{ fontSize: '14px', color: '#059669', fontWeight: 500 }}>
+                  {selectedProperty.predicate}
                 </div>
               </div>
+              <div>
+                <div style={{ fontSize: '12px', color: '#64748b', marginBottom: '4px', fontWeight: 500 }}>
+                  Property Type
+                </div>
+                <div style={{ fontSize: '14px', color: selectedProperty.isDatatype ? '#d97706' : (selectedProperty.isObjectProperty ? '#6366f1' : '#64748b') }}>
+                  {selectedProperty.isDatatype ? 'Datatype Property' : (selectedProperty.isObjectProperty ? 'Object Property' : 'Relationship')}
+                </div>
+              </div>
+              <div>
+                <div style={{ fontSize: '12px', color: '#64748b', marginBottom: '4px', fontWeight: 500 }}>
+                  {selectedProperty.isDatatype ? 'Datatype' : 'Range (Target Class)'}
+                </div>
+                <div style={{
+                  fontSize: '14px',
+                  color: selectedProperty.isDatatype ? '#d97706' : '#6366f1',
+                  fontStyle: selectedProperty.isDatatype ? 'italic' : 'normal',
+                }}>
+                  {selectedProperty.object}
+                </div>
+              </div>
+              {!selectedProperty.isDatatype && getClassHierarchy(selectedProperty.object) && (
+                <div>
+                  <div style={{ fontSize: '12px', color: '#64748b', marginBottom: '4px', fontWeight: 500 }}>
+                    Class Hierarchy
+                  </div>
+                  <div style={{ fontSize: '14px', color: '#1e293b', fontFamily: 'monospace', whiteSpace: 'pre', lineHeight: '1.4' }}>
+                    {getClassHierarchy(selectedProperty.object)!.join('\n')}
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </>

@@ -14,7 +14,13 @@ type TabType = 'file' | 'triples' | 'admin' | 'settings'
 
 function App() {
   const [backendStatus, setBackendStatus] = useState<'loading' | 'ok' | 'error'>('loading')
-  const [activeTab, setActiveTab] = useState<TabType>('file')
+  const [activeTab, setActiveTab] = useState<TabType>(() => {
+    const stored = localStorage.getItem('activeTab')
+    if (stored && ['file', 'triples', 'admin', 'settings'].includes(stored)) {
+      return stored as TabType
+    }
+    return 'file'
+  })
   const [nodes, setNodes] = useState<Node[]>([])
   const [edges, setEdges] = useState<Edge[]>([])
   const [showLoginModal, setShowLoginModal] = useState(false)
@@ -52,6 +58,18 @@ function App() {
       .then((data) => {
         if (data.status === 'ok') {
           setBackendStatus('ok')
+          // Check if server has restarted (new server_id)
+          const storedServerId = localStorage.getItem('server_id')
+          if (data.server_id && storedServerId !== data.server_id) {
+            // Server restarted - clear all login state
+            localStorage.setItem('server_id', data.server_id)
+            localStorage.removeItem('auth')
+            localStorage.removeItem('currentOntology')
+            setAuth({ isLoggedIn: false, username: null, isAdmin: false })
+            setCurrentOntology(null)
+            setNodes([])
+            setEdges([])
+          }
         } else {
           setBackendStatus('error')
         }
@@ -74,6 +92,11 @@ function App() {
       localStorage.removeItem('currentOntology')
     }
   }, [currentOntology])
+
+  // Persist activeTab to localStorage
+  useEffect(() => {
+    localStorage.setItem('activeTab', activeTab)
+  }, [activeTab])
 
   // Track if we've done the initial load
   const initialLoadDone = useRef(false)
@@ -121,6 +144,98 @@ function App() {
     setNodes(newNodes)
     setEdges(newEdges)
   }, [])
+
+  // Update JSON modal when nodes/edges change (if modal is open and showing ontology)
+  useEffect(() => {
+    if (!showJsonModal || !currentOntology || selectedKnowledgeGraph) return
+
+    // Helper to create safe URI
+    const toUri = (label: string) => label.replace(/\s+/g, '_')
+
+    // Create node ID to label mapping
+    const idToLabel = new Map<string, string>()
+    nodes.forEach((n) => {
+      idToLabel.set(n.id, n.data.label || n.id)
+    })
+
+    // Generate ontology JSON-LD
+    const graph: Record<string, unknown>[] = []
+
+    // Add classes
+    for (const node of nodes) {
+      const label = node.data.label || node.id
+      const classEntry: Record<string, unknown> = {
+        "@id": toUri(label),
+        "@type": "owl:Class",
+        "rdfs:label": label
+      }
+      graph.push(classEntry)
+    }
+
+    // Add relationships
+    for (const edge of edges) {
+      const sourceLabel = idToLabel.get(edge.source) || edge.source
+      const predicate = typeof edge.label === 'string' ? edge.label : 'relatedTo'
+
+      if (edge.datatype) {
+        // Datatype property
+        const datatypeMap: Record<string, string> = {
+          'string': 'xsd:string',
+          'integer': 'xsd:integer',
+          'float': 'xsd:float',
+          'double': 'xsd:double',
+          'boolean': 'xsd:boolean',
+          'date': 'xsd:date',
+          'datetime': 'xsd:dateTime',
+        }
+        const xsdType = datatypeMap[edge.datatype.toLowerCase()] || `xsd:${edge.datatype}`
+        const existing = graph.find(e => e["@id"] === toUri(predicate) && e["@type"] === "owl:DatatypeProperty")
+        if (!existing) {
+          graph.push({
+            "@id": toUri(predicate),
+            "@type": "owl:DatatypeProperty",
+            "rdfs:domain": { "@id": toUri(sourceLabel) },
+            "rdfs:range": { "@id": xsdType }
+          })
+        }
+      } else if (predicate === 'subClassOf' && edge.target) {
+        const targetLabel = idToLabel.get(edge.target) || edge.target
+        const entry = graph.find(e => e["@id"] === toUri(sourceLabel))
+        if (entry) {
+          entry["rdfs:subClassOf"] = { "@id": toUri(targetLabel) }
+        }
+      } else if (edge.target) {
+        const targetLabel = idToLabel.get(edge.target) || edge.target
+        const existing = graph.find(e => e["@id"] === toUri(predicate) && e["@type"] === "owl:ObjectProperty")
+        if (!existing) {
+          graph.push({
+            "@id": toUri(predicate),
+            "@type": "owl:ObjectProperty",
+            "rdfs:domain": { "@id": toUri(sourceLabel) },
+            "rdfs:range": { "@id": toUri(targetLabel) }
+          })
+        }
+      }
+    }
+
+    const jsonld = {
+      "@context": {
+        "@vocab": "http://example.org/ontology#",
+        "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+        "owl": "http://www.w3.org/2002/07/owl#",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+      },
+      "@id": toUri(currentOntology.name),
+      "@type": "owl:Ontology",
+      "rdfs:label": currentOntology.name,
+      "@graph": graph
+    }
+
+    setJsonModalData({
+      title: `${currentOntology.name} (Ontology)`,
+      json: JSON.stringify(jsonld, null, 2)
+    })
+  }, [nodes, edges, showJsonModal, currentOntology, selectedKnowledgeGraph])
 
   const handleLogin = async (username: string, password: string): Promise<{ success: boolean; message?: string }> => {
     try {
@@ -327,17 +442,39 @@ function App() {
       // Add relationships
       for (const edge of edges) {
         const sourceLabel = idToLabel.get(edge.source) || edge.source
-        const targetLabel = idToLabel.get(edge.target) || edge.target
         const predicate = typeof edge.label === 'string' ? edge.label : 'relatedTo'
 
-        if (predicate === 'subClassOf') {
+        if (edge.datatype) {
+          // Datatype property
+          const datatypeMap: Record<string, string> = {
+            'string': 'xsd:string',
+            'integer': 'xsd:integer',
+            'float': 'xsd:float',
+            'double': 'xsd:double',
+            'boolean': 'xsd:boolean',
+            'date': 'xsd:date',
+            'datetime': 'xsd:dateTime',
+          }
+          const xsdType = datatypeMap[edge.datatype.toLowerCase()] || `xsd:${edge.datatype}`
+          const existing = graph.find(e => e["@id"] === toUri(predicate) && e["@type"] === "owl:DatatypeProperty")
+          if (!existing) {
+            graph.push({
+              "@id": toUri(predicate),
+              "@type": "owl:DatatypeProperty",
+              "rdfs:domain": { "@id": toUri(sourceLabel) },
+              "rdfs:range": { "@id": xsdType }
+            })
+          }
+        } else if (predicate === 'subClassOf' && edge.target) {
           // Add subClassOf to the class entry
+          const targetLabel = idToLabel.get(edge.target) || edge.target
           const entry = graph.find(e => e["@id"] === toUri(sourceLabel))
           if (entry) {
             entry["rdfs:subClassOf"] = { "@id": toUri(targetLabel) }
           }
-        } else {
+        } else if (edge.target) {
           // Add as object property
+          const targetLabel = idToLabel.get(edge.target) || edge.target
           const existing = graph.find(e => e["@id"] === toUri(predicate) && e["@type"] === "owl:ObjectProperty")
           if (!existing) {
             graph.push({
@@ -611,23 +748,30 @@ function App() {
                     </label>
                     <button
                       onClick={handleCreateKnowledgeGraphClick}
+                      disabled={!currentOntology}
                       style={{
                         padding: '6px 12px',
-                        backgroundColor: '#6366f1',
+                        backgroundColor: currentOntology ? '#6366f1' : '#94a3b8',
                         color: 'white',
                         border: 'none',
                         borderRadius: '6px',
                         fontSize: '14px',
                         fontWeight: 500,
-                        cursor: 'pointer',
+                        cursor: currentOntology ? 'pointer' : 'not-allowed',
                         transition: 'background-color 0.2s',
+                        opacity: currentOntology ? 1 : 0.6,
                       }}
                       onMouseEnter={(e) => {
-                        e.currentTarget.style.backgroundColor = '#4f46e5'
+                        if (currentOntology) {
+                          e.currentTarget.style.backgroundColor = '#4f46e5'
+                        }
                       }}
                       onMouseLeave={(e) => {
-                        e.currentTarget.style.backgroundColor = '#6366f1'
+                        if (currentOntology) {
+                          e.currentTarget.style.backgroundColor = '#6366f1'
+                        }
                       }}
+                      title={!currentOntology ? 'Select an ontology first' : ''}
                     >
                       Add Knowledge Graph Instance
                     </button>
